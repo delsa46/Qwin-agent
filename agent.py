@@ -1,15 +1,44 @@
 import json
+import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from parser import parse_agent_output
 from device_tools import execute_tool
 
 
-MODEL_SERVER = "http://94.101.135.237:9000/v1/chat/completions"
-MODEL_NAME = "Qwen"
-API_KEY = "tensorrt_llm"
+def _load_dotenv(dotenv_path: str | Path | None = None) -> None:
+    path = Path(dotenv_path or ".env")
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if not key:
+            continue
+        if key in os.environ:
+            continue
+        os.environ[key] = value
+
+
+_load_dotenv()
+
+
+MODEL_SERVER = os.getenv(
+    "MODEL_SERVER",
+    "http://94.101.135.237:9000/v1/chat/completions",
+)
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen")
+API_KEY = os.getenv("MODEL_API_KEY", "tensorrt_llm")
 
 
 SYSTEM_PROMPT = """You are a strict device CRUD agent.
@@ -56,7 +85,8 @@ Rules:
 - In ask blocks, include the intended tool name in the tool field
 - If enough information exists, call exactly one tool
 - For create_device required fields are: device_name, device_type
-- Optional create_device fields: device_id, role, description, group, save_data, tags, features
+- Allowed device_type values: sensor, gateway, controller, processor, ipcamera
+- Optional create_device field: device_id
 - For update_device required field is: device_id and at least one of device_name, device_type, role, description, group, save_data, status, tags, features
 - For delete_device required field is: device_id
 - For get_device required field is: device_id
@@ -131,7 +161,7 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "create_device":
         device = tool_result["device"]
-        device_target_id = device.get("deviceId", device["id"])
+        device_target_id = device.get("deviceId") or device.get("id", "")
         return build_fe_response(
             context={
                 "entity": "device",
@@ -150,7 +180,7 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "get_device":
         device = tool_result["device"]
-        device_target_id = device.get("deviceId", device["id"])
+        device_target_id = device.get("deviceId") or device.get("id", "")
         return build_fe_response(
             context={
                 "entity": "device",
@@ -169,7 +199,7 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "update_device":
         device = tool_result["device"]
-        device_target_id = device.get("deviceId", device["id"])
+        device_target_id = device.get("deviceId") or device.get("id", "")
         return build_fe_response(
             context={
                 "entity": "device",

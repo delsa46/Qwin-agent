@@ -369,6 +369,7 @@ class DeviceAgentSession:
                 text,
                 [
                     r"\b(dev-[a-zA-Z0-9_-]+)\b",
+                    r"\b(device-[a-zA-Z0-9_-]+)\b",
                     r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b",
                     r"^\s*id\s+is\s+([a-zA-Z0-9._\-]+)\s*$",
                 ],
@@ -394,6 +395,7 @@ class DeviceAgentSession:
             if (
                 device_id != raw
                 or re.match(r"^\s*dev-[a-zA-Z0-9_-]+\s*$", raw, re.IGNORECASE)
+                or re.match(r"^\s*device-[a-zA-Z0-9_-]+\s*$", raw, re.IGNORECASE)
                 or re.match(
                     r"^\s*[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\s*$",
                     raw,

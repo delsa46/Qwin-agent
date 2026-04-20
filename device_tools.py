@@ -1,17 +1,94 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Optional
-from uuid import uuid4
+import json
+import os
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from schemas import Device
+ALLOWED_DEVICE_TYPES = {"sensor", "gateway", "controller", "processor", "ipcamera"}
 
 
-DEVICE_DB: dict[str, Device] = {}
+def _load_dotenv(dotenv_path: str | Path | None = None) -> None:
+    path = Path(dotenv_path or ".env")
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if not key:
+            continue
+        if key in os.environ:
+            continue
+        os.environ[key] = value
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+_load_dotenv()
+
+
+class BackendRequestError(Exception):
+    pass
+
+
+def _get_base_url() -> str:
+    return os.getenv("SENSOLIST_BASE_URL", "http://be-dev.sensolist.com/api").rstrip("/")
+
+
+def _get_api_token() -> str:
+    token = os.getenv("SENSOLIST_API_TOKEN", "")
+    if not token:
+        raise BackendRequestError("Missing SENSOLIST_API_TOKEN environment variable")
+    return token.strip()
+
+
+def _http_request(method: str, path: str, payload: Optional[dict] = None) -> Any:
+    url = f"{_get_base_url()}{path}"
+    headers = {
+        "Authorization": f"Bearer {_get_api_token()}",
+        "Content-Type": "application/json",
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return {}
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        try:
+            parsed = json.loads(error_body)
+            message = parsed.get("error") or parsed.get("message") or error_body
+        except json.JSONDecodeError:
+            message = error_body or exc.reason
+        raise BackendRequestError(
+            f"Backend request failed ({exc.code}): {message}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise BackendRequestError(f"Backend request failed: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise BackendRequestError("Invalid JSON response from backend") from exc
+
+
+def _call_backend_api(method: str, path: str, payload: Optional[dict] = None) -> dict:
+    try:
+        response = _http_request(method, path, payload)
+        return {"ok": True, "data": response}
+    except BackendRequestError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 def _parse_bool(value: Any, default: bool = True) -> bool:
@@ -59,7 +136,6 @@ def _parse_features(raw: Any) -> tuple[list[dict[str, str]], Optional[str]]:
     if not text:
         return [], None
 
-    # format: field|label|path|unit|value;field|label|path|unit|value
     features: list[dict[str, str]] = []
     for raw_feature in text.split(";"):
         part = raw_feature.strip()
@@ -84,7 +160,6 @@ def _parse_features(raw: Any) -> tuple[list[dict[str, str]], Optional[str]]:
 
 
 def _build_group(group_name: str) -> dict[str, Any]:
-    now = _now_iso()
     return {
         "id": f"group-{group_name}" if group_name else "",
         "name": group_name,
@@ -94,8 +169,8 @@ def _build_group(group_name: str) -> dict[str, Any]:
         "template": "",
         "roles": [],
         "features": [],
-        "createdAt": now,
-        "updatedAt": now,
+        "createdAt": "",
+        "updatedAt": "",
     }
 
 
@@ -110,96 +185,124 @@ def _build_tag_objects(tag_names: list[str]) -> list[dict[str, str]]:
     ]
 
 
-def _to_public_device(device: Device) -> dict[str, Any]:
-    tag_names = device.get("tags", [])
-    group_name = device.get("group", "")
-    return {
-        "id": device["id"],
-        "deviceId": device["deviceId"],
-        "name": device["name"],
-        "type": device["type"],
-        "role": device.get("role", ""),
-        "description": device.get("description", ""),
-        "saveData": device.get("saveData", True),
-        "status": device.get("status", True),
-        "features": device.get("features", []),
-        "group": _build_group(group_name),
-        "tags": _build_tag_objects(tag_names),
-        "createdAt": device.get("createdAt", ""),
-        "updatedAt": device.get("updatedAt", ""),
-        "publishedAt": device.get("publishedAt", ""),
-    }
+def _normalize_device_payload(device: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(device)
+
+    group_value = normalized.get("group", "")
+    if isinstance(group_value, str):
+        normalized["group"] = _build_group(group_value)
+    elif isinstance(group_value, dict):
+        normalized_group = _build_group(str(group_value.get("name", "")))
+        normalized_group.update(group_value)
+        normalized["group"] = normalized_group
+    else:
+        normalized["group"] = _build_group("")
+
+    tags_value = normalized.get("tags", [])
+    if isinstance(tags_value, list) and tags_value:
+        if all(isinstance(item, str) for item in tags_value):
+            normalized["tags"] = _build_tag_objects([str(item) for item in tags_value])
+        elif all(isinstance(item, dict) for item in tags_value):
+            normalized["tags"] = [item for item in tags_value if isinstance(item, dict)]
+        else:
+            normalized["tags"] = []
+    else:
+        normalized["tags"] = []
+
+    features_value = normalized.get("features", [])
+    normalized["features"] = [
+        item for item in features_value if isinstance(item, dict)
+    ] if isinstance(features_value, list) else []
+
+    return normalized
+
+
+def _extract_device(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict):
+        if "device" in data and isinstance(data["device"], dict):
+            return _normalize_device_payload(data["device"])
+        if "data" in data and isinstance(data["data"], dict):
+            return _normalize_device_payload(data["data"])
+        if "item" in data and isinstance(data["item"], dict):
+            return _normalize_device_payload(data["item"])
+        if "result" in data and isinstance(data["result"], dict):
+            return _normalize_device_payload(data["result"])
+        if any(key in data for key in ("deviceId", "name", "type")):
+            return _normalize_device_payload(data)
+    return {}
+
+
+def _extract_device_list(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [
+            _normalize_device_payload(item) if isinstance(item, dict) else item
+            for item in data
+        ]
+
+    if isinstance(data, dict):
+        for key in ("devices", "data", "items", "results", "result", "List"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [
+                    _normalize_device_payload(item) if isinstance(item, dict) else item
+                    for item in value
+                ]
+    return []
 
 
 def create_device(
     *,
     name: str,
     type: str,
-    role: str = "",
-    description: str = "",
-    group: str = "",
-    save_data: bool = True,
-    tags: Optional[list[str]] = None,
-    features: Optional[list[dict[str, str]]] = None,
     device_id: Optional[str] = None,
 ) -> dict:
-    now = _now_iso()
-    public_device_id = device_id or f"dev-{uuid4().hex[:10]}"
-    if public_device_id in DEVICE_DB:
+    if not name or not type:
         return {
             "ok": False,
-            "error": f"Device '{public_device_id}' already exists.",
+            "error": "Missing required fields for create_device: name, type",
         }
 
-    normalized_type = (type or "").strip().lower()
-    default_role = "network" if normalized_type == "gateway" else "sensor"
-    resolved_role = role or default_role
-    resolved_group = group or "building-a"
-    resolved_description = description or f"{resolved_role.capitalize()} {normalized_type or 'device'} sensor"
-    resolved_tags = tags or [resolved_role, normalized_type or "device"]
-    resolved_features = features or (
-        [
-            {
-                "field": "network",
-                "label": "Network",
-                "path": "sensors.net",
-                "unit": "Mbps",
-                "value": "1000",
-            }
-        ]
-        if normalized_type == "gateway"
-        else []
-    )
+    type_value = str(type).strip().lower()
+    if type_value not in ALLOWED_DEVICE_TYPES:
+        return {
+            "ok": False,
+            "error": (
+                "Invalid device type. Allowed values are: "
+                "sensor, gateway, controller, processor, ipcamera"
+            ),
+        }
 
-    device: Device = {
-        "id": str(uuid4()),
-        "deviceId": public_device_id,
+    payload: dict[str, Any] = {
         "name": name,
-        "type": type,
-        "role": resolved_role,
-        "description": resolved_description,
-        "group": resolved_group,
-        "saveData": save_data,
-        "status": True,
-        "tags": resolved_tags,
-        "features": resolved_features,
-        "createdAt": now,
-        "updatedAt": now,
-        "publishedAt": "",
+        "type": type_value,
     }
-    DEVICE_DB[public_device_id] = device
-    return {"ok": True, "device": _to_public_device(device)}
+    if device_id:
+        payload["deviceId"] = device_id
+
+    response = _call_backend_api("POST", "/device", payload)
+    if not response["ok"]:
+        return response
+
+    device = _extract_device(response["data"])
+    if not device:
+        return {"ok": False, "error": "Unexpected backend response for create_device."}
+
+    return {"ok": True, "device": device}
 
 
 def get_device(device_id: str) -> dict:
-    device = DEVICE_DB.get(device_id)
-    if not device:
-        return {
-            "ok": False,
-            "error": f"Device '{device_id}' not found.",
-        }
+    if not device_id:
+        return {"ok": False, "error": "Missing required field for get_device: device_id"}
 
-    return {"ok": True, "device": _to_public_device(device)}
+    response = _call_backend_api("GET", f"/device/{device_id}")
+    if not response["ok"]:
+        return response
+
+    device = _extract_device(response["data"])
+    if not device:
+        return {"ok": False, "error": "Unexpected backend response for get_device."}
+
+    return {"ok": True, "device": device}
 
 
 def update_device(
@@ -215,53 +318,71 @@ def update_device(
     tags: Optional[list[str]] = None,
     features: Optional[list[dict[str, str]]] = None,
 ) -> dict:
-    device = DEVICE_DB.get(device_id)
-    if not device:
+    if not device_id:
+        return {"ok": False, "error": "Missing required field for update_device: device_id"}
+
+    payload: dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name
+    if type is not None:
+        payload["type"] = type
+    if role is not None:
+        payload["role"] = role
+    if description is not None:
+        payload["description"] = description
+    if group is not None:
+        payload["group"] = group
+    if save_data is not None:
+        payload["saveData"] = save_data
+    if status is not None:
+        payload["status"] = status
+    if tags is not None:
+        payload["tags"] = tags
+    if features is not None:
+        payload["features"] = features
+
+    if not payload:
         return {
             "ok": False,
-            "error": f"Device '{device_id}' not found.",
+            "error": (
+                "Missing update payload for update_device: provide at least one of "
+                "name, type, role, description, group, saveData, status, tags, features"
+            ),
         }
 
-    if name is not None:
-        device["name"] = name
-    if type is not None:
-        device["type"] = type
-    if role is not None:
-        device["role"] = role
-    if description is not None:
-        device["description"] = description
-    if group is not None:
-        device["group"] = group
-    if save_data is not None:
-        device["saveData"] = save_data
-    if status is not None:
-        device["status"] = status
-    if tags is not None:
-        device["tags"] = tags
-    if features is not None:
-        device["features"] = features
+    response = _call_backend_api("PATCH", f"/device/{device_id}", payload)
+    if not response["ok"]:
+        return response
 
-    device["updatedAt"] = _now_iso()
-    return {"ok": True, "device": _to_public_device(device)}
+    device = _extract_device(response["data"])
+    if not device:
+        return {"ok": False, "error": "Unexpected backend response for update_device."}
+
+    return {"ok": True, "device": device}
 
 
 def delete_device(device_id: str) -> dict:
-    device = DEVICE_DB.get(device_id)
-    if not device:
-        return {
-            "ok": False,
-            "error": f"Device '{device_id}' not found.",
-        }
+    if not device_id:
+        return {"ok": False, "error": "Missing required field for delete_device: device_id"}
 
-    deleted = DEVICE_DB.pop(device_id)
-    return {"ok": True, "deleted": True, "device": _to_public_device(deleted)}
+    response = _call_backend_api("DELETE", f"/device/{device_id}")
+    if not response["ok"]:
+        return response
+
+    device = _extract_device(response["data"])
+    if not device:
+        return {"ok": False, "error": "Unexpected backend response for delete_device."}
+
+    return {"ok": True, "deleted": True, "device": device}
 
 
 def list_devices() -> dict:
-    return {
-        "ok": True,
-        "devices": [_to_public_device(item) for item in DEVICE_DB.values()],
-    }
+    response = _call_backend_api("GET", "/device")
+    if not response["ok"]:
+        return response
+
+    devices = _extract_device_list(response["data"])
+    return {"ok": True, "devices": devices}
 
 
 def execute_tool(tool_data: dict) -> dict:
@@ -276,19 +397,9 @@ def execute_tool(tool_data: dict) -> dict:
                 "error": "Missing required fields for create_device: device_name, device_type",
             }
 
-        features, feature_error = _parse_features(tool_data.get("features"))
-        if feature_error:
-            return {"ok": False, "error": feature_error}
-
         return create_device(
             name=name,
             type=type_,
-            role=str(tool_data.get("role", "")).strip(),
-            description=str(tool_data.get("description", "")).strip(),
-            group=str(tool_data.get("group", "")).strip(),
-            save_data=_parse_bool(tool_data.get("save_data"), default=True),
-            tags=_parse_tags(tool_data.get("tags")),
-            features=features,
             device_id=str(tool_data.get("device_id", "")).strip() or None,
         )
 

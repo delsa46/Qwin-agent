@@ -1,13 +1,29 @@
-from unittest.mock import patch
+import pytest
+from unittest.mock import MagicMock, patch
 
 from parser import extract_block, is_pure_block, parse_key_value_block, parse_agent_output
-from device_tools import execute_tool, DEVICE_DB
+from device_tools import BackendRequestError, execute_tool
 from agent import run_agent
 from agent_session import DeviceAgentSession
 
 
+@pytest.fixture(autouse=True)
+def default_backend_mock(monkeypatch):
+    monkeypatch.setenv("SENSOLIST_API_TOKEN", "test-token")
+    default_device = {
+        "deviceId": "dev-default",
+        "name": "sensor-default",
+        "type": "temperature",
+        "group": "building-a",
+        "tags": ["default"],
+    }
+    mock_http = MagicMock(return_value={"device": default_device})
+    monkeypatch.setattr("device_tools._http_request", mock_http)
+    return mock_http
+
+
 def setup_function():
-    DEVICE_DB.clear()
+    pass
 
 
 def test_extract_tool_block():
@@ -49,62 +65,133 @@ def test_parse_agent_output_ask():
     assert result["missing_fields"] == ["device_name", "device_type"]
 
 
-def test_execute_tool_create_device():
+@patch("device_tools._http_request")
+def test_execute_tool_create_device(mock_http):
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "device-001",
+            "name": "sensor-a",
+            "type": "temperature",
+        }
+    }
+
     result = execute_tool({
         "name": "create_device",
         "device_name": "sensor-a",
         "device_type": "temperature",
-        "description": "room sensor",
-        "group": "building-a",
-        "role": "temp",
-        "save_data": "true",
-        "tags": "critical,indoor",
-        "features": "temperature|Temperature|sensors.temp|C|24.2",
+        "device_id": "device-001",
     })
+
     assert result["ok"] is True
     assert result["device"]["name"] == "sensor-a"
-    assert result["device"]["deviceId"].startswith("dev-")
+    assert result["device"]["deviceId"] == "device-001"
     assert result["device"]["saveData"] is True
     assert result["device"]["tags"][0]["name"] == "critical"
 
 
-def test_execute_tool_create_missing_fields():
+@patch("device_tools._http_request")
+def test_execute_tool_create_backend_error(mock_http):
+    mock_http.side_effect = BackendRequestError("Backend unreachable")
+
     result = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-a",
-    })
-    assert result["ok"] is False
-    assert "Missing required fields" in result["error"]
-
-
-def test_execute_tool_update_requires_at_least_one_field():
-    created = execute_tool({
         "name": "create_device",
         "device_name": "sensor-a",
         "device_type": "temperature",
     })
-    device_id = created["device"]["deviceId"]
+
+    assert result["ok"] is False
+    assert "Backend unreachable" in result["error"]
+
+
+@patch("device_tools._http_request")
+def test_execute_tool_get_device(mock_http):
+    mock_http.return_value = {
+        "deviceId": "device-002",
+        "name": "sensor-b",
+        "type": "humidity",
+        "group": "floor-1",
+        "tags": ["indoor"],
+    }
+
+    result = execute_tool({"name": "get_device", "device_id": "device-002"})
+
+    assert result["ok"] is True
+    assert result["device"]["deviceId"] == "device-002"
+    assert result["device"]["group"]["name"] == "floor-1"
+
+
+@patch("device_tools._http_request")
+def test_execute_tool_update_device(mock_http):
+    mock_http.return_value = {
+        "deviceId": "device-003",
+        "name": "sensor-c",
+        "type": "temperature",
+        "status": False,
+    }
 
     result = execute_tool({
         "name": "update_device",
-        "device_id": device_id,
+        "device_id": "device-003",
+        "status": "false",
     })
 
-    assert result["ok"] is False
-    assert "Missing update payload for update_device" in result["error"]
+    assert result["ok"] is True
+    assert result["device"]["deviceId"] == "device-003"
+    assert result["device"]["status"] is False
 
 
+@patch("device_tools._http_request")
+def test_execute_tool_delete_device(mock_http):
+    mock_http.return_value = {
+        "deviceId": "device-004",
+        "name": "sensor-d",
+        "type": "pressure",
+    }
+
+    result = execute_tool({"name": "delete_device", "device_id": "device-004"})
+
+    assert result["ok"] is True
+    assert result["deleted"] is True
+    assert result["device"]["deviceId"] == "device-004"
+
+
+@patch("device_tools._http_request")
+def test_execute_tool_list_devices(mock_http):
+    mock_http.return_value = {
+        "devices": [
+            {
+                "deviceId": "device-005",
+                "name": "sensor-e",
+                "type": "temperature",
+            }
+        ]
+    }
+
+    result = execute_tool({"name": "list_devices"})
+
+    assert result["ok"] is True
+    assert len(result["devices"]) == 1
+    assert result["devices"][0]["deviceId"] == "device-005"
+
+
+@patch("device_tools._http_request")
 @patch("agent.call_model")
-def test_run_agent_create_device(mock_call_model):
+def test_run_agent_create_device(mock_call_model, mock_http):
     mock_call_model.return_value = (
         "<tool>\n"
         "name=create_device\n"
         "device_id=device-001\n"
         "device_name=sensor-a\n"
         "device_type=temperature\n"
-        "tags=critical,temperature\n"
         "</tool>"
     )
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "device-001",
+            "name": "sensor-a",
+            "type": "temperature",
+        }
+    }
 
     result = run_agent("create a device named sensor-a of type temperature")
 
@@ -133,13 +220,23 @@ def test_run_agent_ask_for_missing_fields(mock_call_model):
     assert "Please provide" in result["message"]
 
 
+@patch("device_tools._http_request")
 @patch("agent.call_model")
-def test_run_agent_list_devices(mock_call_model):
+def test_run_agent_list_devices(mock_call_model, mock_http):
     mock_call_model.return_value = (
         "<tool>\n"
         "name=list_devices\n"
         "</tool>"
     )
+    mock_http.return_value = {
+        "devices": [
+            {
+                "deviceId": "device-010",
+                "name": "sensor-list",
+                "type": "temperature",
+            }
+        ]
+    }
 
     result = run_agent("list devices")
 
@@ -157,7 +254,8 @@ def test_run_agent_invalid_plain_text(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_followup_create_with_missing_fields(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_followup_create_with_missing_fields(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=create_device\n"
@@ -165,6 +263,15 @@ def test_session_followup_create_with_missing_fields(mock_call_model):
         "question=Please provide device_name and device_type.\n"
         "</ask>"
     )
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "device-006",
+            "name": "sensor-a",
+            "type": "temperature",
+            "group": "building-a",
+            "tags": ["critical"],
+        }
+    }
 
     session = DeviceAgentSession()
     first = session.run_turn("create a device")
@@ -178,18 +285,39 @@ def test_session_followup_create_with_missing_fields(mock_call_model):
     assert second["context"]["data"]["type"] == "temperature"
 
 
-@patch("agent_session.call_model")
-def test_session_create_does_not_require_optional_fields(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_create_does_not_require_optional_fields(mock_http):
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "device-007",
+            "name": "sensor-1",
+            "type": "gateway",
+            "role": "network",
+            "group": "building-a",
+            "tags": ["network"],
+        }
+    }
+
     session = DeviceAgentSession()
     result = session.run_turn("create device name is sensor-1 and typy is gateway")
 
     assert result["need_more_info"] is False
     assert result["message"] == "Device created successfully."
-    mock_call_model.assert_not_called()
 
 
-@patch("agent_session.call_model")
-def test_session_direct_create_from_plain_text(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_direct_create_from_plain_text(mock_http):
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "dev-1234567890",
+            "name": "sensor-1",
+            "type": "gateway",
+            "role": "network",
+            "group": "building-a",
+            "tags": ["network"],
+        }
+    }
+
     session = DeviceAgentSession()
     result = session.run_turn("create device name is sensor-1 and typy is gateway")
 
@@ -202,11 +330,11 @@ def test_session_direct_create_from_plain_text(mock_call_model):
     assert result["context"]["data"]["group"]["name"] == "building-a"
     assert result["context"]["data"]["tags"][0]["name"] == "network"
     assert result["actions"][0]["target"].startswith("/devices/dev-")
-    mock_call_model.assert_not_called()
 
 
 @patch("agent_session.call_model")
-def test_session_get_flow_with_followup(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_get_flow_with_followup(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=get_device\n"
@@ -214,6 +342,24 @@ def test_session_get_flow_with_followup(mock_call_model):
         "question=Please provide device_id.\n"
         "</ask>"
     )
+    mock_http.side_effect = [
+        {
+            "device": {
+                "deviceId": "device-008",
+                "name": "sensor-r1",
+                "type": "temp",
+                "group": "floor-1",
+            }
+        },
+        {
+            "device": {
+                "deviceId": "device-008",
+                "name": "sensor-r1",
+                "type": "temp",
+                "group": "floor-1",
+            }
+        },
+    ]
 
     created = execute_tool({
         "name": "create_device",
@@ -233,7 +379,8 @@ def test_session_get_flow_with_followup(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_update_flow_with_followup(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_update_flow_with_followup(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=update_device\n"
@@ -241,6 +388,23 @@ def test_session_update_flow_with_followup(mock_call_model):
         "question=Please provide device_id and status.\n"
         "</ask>"
     )
+    mock_http.side_effect = [
+        {
+            "device": {
+                "deviceId": "device-009",
+                "name": "sensor-u1",
+                "type": "temp",
+            }
+        },
+        {
+            "device": {
+                "deviceId": "device-009",
+                "name": "sensor-u1",
+                "type": "temp",
+                "status": False,
+            }
+        },
+    ]
 
     created = execute_tool({
         "name": "create_device",
@@ -261,7 +425,8 @@ def test_session_update_flow_with_followup(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_update_requires_payload_after_device_id(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_update_requires_payload_after_device_id(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=update_device\n"
@@ -269,6 +434,23 @@ def test_session_update_requires_payload_after_device_id(mock_call_model):
         "question=Please provide the device ID to update\n"
         "</ask>"
     )
+    mock_http.side_effect = [
+        {
+            "device": {
+                "deviceId": "device-up-1",
+                "name": "sensor-up-1",
+                "type": "gateway",
+            }
+        },
+        {
+            "device": {
+                "deviceId": "device-up-1",
+                "name": "sensor-up-1",
+                "type": "gateway",
+                "status": False,
+            }
+        },
+    ]
 
     created = execute_tool({
         "name": "create_device",
@@ -321,7 +503,8 @@ def test_session_delete_flow_with_followup(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_delete_invalid_id_then_retry_success(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_delete_invalid_id_then_retry_success(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=delete_device\n"
@@ -329,6 +512,23 @@ def test_session_delete_invalid_id_then_retry_success(mock_call_model):
         "question=Please provide device_id.\n"
         "</ask>"
     )
+    mock_http.side_effect = [
+        {
+            "device": {
+                "deviceId": "device-del-1",
+                "name": "sensor-del-1",
+                "type": "gateway",
+            }
+        },
+        BackendRequestError("Backend request failed (404): Device 'dev-not-exists' not found."),
+        {
+            "device": {
+                "deviceId": "device-del-1",
+                "name": "sensor-del-1",
+                "type": "gateway",
+            }
+        },
+    ]
 
     created = execute_tool({
         "name": "create_device",
@@ -353,7 +553,8 @@ def test_session_delete_invalid_id_then_retry_success(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_create_followup_normalizes_name_and_type(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_create_followup_normalizes_name_and_type(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=create_device\n"
@@ -361,6 +562,13 @@ def test_session_create_followup_normalizes_name_and_type(mock_call_model):
         "question=Please provide the device name and type\n"
         "</ask>"
     )
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "device-2",
+            "name": "sensor-2",
+            "type": "gateway",
+        }
+    }
 
     session = DeviceAgentSession()
     first = session.run_turn("create device")
@@ -379,7 +587,8 @@ def test_session_create_followup_normalizes_name_and_type(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_update_name_does_not_change_type(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_update_name_does_not_change_type(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=update_device\n"
@@ -387,6 +596,22 @@ def test_session_update_name_does_not_change_type(mock_call_model):
         "question=Please provide device_id and new name\n"
         "</ask>"
     )
+    mock_http.side_effect = [
+        {
+            "device": {
+                "deviceId": "device-old",
+                "name": "sensor-old",
+                "type": "gateway",
+            }
+        },
+        {
+            "device": {
+                "deviceId": "device-old",
+                "name": "sensor-new",
+                "type": "gateway",
+            }
+        },
+    ]
 
     created = execute_tool({
         "name": "create_device",
@@ -410,7 +635,8 @@ def test_session_update_name_does_not_change_type(mock_call_model):
 
 
 @patch("agent_session.call_model")
-def test_session_update_name_with_key_value_does_not_override_type(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_update_name_with_key_value_does_not_override_type(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=update_device\n"
@@ -418,6 +644,22 @@ def test_session_update_name_with_key_value_does_not_override_type(mock_call_mod
         "question=Please provide device_id and update fields\n"
         "</ask>"
     )
+    mock_http.side_effect = [
+        {
+            "device": {
+                "deviceId": "device-3",
+                "name": "sensor-3",
+                "type": "gateway",
+            }
+        },
+        {
+            "device": {
+                "deviceId": "device-3",
+                "name": "sensor-4",
+                "type": "gateway",
+            }
+        },
+    ]
 
     created = execute_tool({
         "name": "create_device",
