@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -38,6 +40,34 @@ class BackendRequestError(Exception):
     pass
 
 
+def _log_tool_event(event: str, **payload: Any) -> None:
+    try:
+        line = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **payload,
+        }
+        with Path("agent_events.log").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def _contract_error(operation: str, data: Any, hint: str) -> dict:
+    if isinstance(data, dict):
+        keys = list(data.keys())
+    elif isinstance(data, list):
+        keys = ["<list>"]
+    else:
+        keys = [str(type(data))]
+    message = (
+        f"Contract check failed for {operation}: {hint}. "
+        f"Received keys/type: {keys}"
+    )
+    _log_tool_event("contract_error", operation=operation, hint=hint, received=keys)
+    return {"ok": False, "error": message}
+
+
 def _get_base_url() -> str:
     return os.getenv("SENSOLIST_BASE_URL", "http://be-dev.sensolist.com/api").rstrip("/")
 
@@ -46,7 +76,10 @@ def _get_api_token() -> str:
     token = os.getenv("SENSOLIST_API_TOKEN", "")
     if not token:
         raise BackendRequestError("Missing SENSOLIST_API_TOKEN environment variable")
-    return token.strip()
+    token = token.strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
 
 
 def _http_request(method: str, path: str, payload: Optional[dict] = None) -> Any:
@@ -88,6 +121,13 @@ def _call_backend_api(method: str, path: str, payload: Optional[dict] = None) ->
         response = _http_request(method, path, payload)
         return {"ok": True, "data": response}
     except BackendRequestError as exc:
+        _log_tool_event(
+            "backend_error",
+            method=method,
+            path=path,
+            payload=payload or {},
+            error=str(exc),
+        )
         return {"ok": False, "error": str(exc)}
 
 
@@ -240,26 +280,98 @@ def _extract_device_list(data: Any) -> list[dict[str, Any]]:
         ]
 
     if isinstance(data, dict):
-        for key in ("devices", "data", "items", "results", "result", "List"):
+        list_keys = ("devices", "data", "items", "results", "result", "List", "list", "docs")
+        for key in list_keys:
             value = data.get(key)
             if isinstance(value, list):
                 return [
                     _normalize_device_payload(item) if isinstance(item, dict) else item
                     for item in value
                 ]
+            if isinstance(value, dict):
+                for nested_key in list_keys:
+                    nested_value = value.get(nested_key)
+                    if isinstance(nested_value, list):
+                        return [
+                            _normalize_device_payload(item) if isinstance(item, dict) else item
+                            for item in nested_value
+                        ]
     return []
+
+
+def _is_object_id(value: str) -> bool:
+    return re.fullmatch(r"[0-9a-fA-F]{24}", value or "") is not None
+
+
+def _is_device_id_lookup_error(error_text: str) -> bool:
+    text = str(error_text or "").lower()
+    return (
+        "not found" in text
+        or "invalid device id" in text
+        or "not a valid objectid" in text
+    )
+
+
+def _find_device_in_list(raw_device_id: str) -> Optional[dict[str, Any]]:
+    listed = list_devices()
+    if not listed.get("ok"):
+        return None
+
+    needle = str(raw_device_id or "").strip()
+    if not needle:
+        return None
+
+    for item in listed.get("devices", []):
+        if not isinstance(item, dict):
+            continue
+        candidate_device_id = str(item.get("deviceId", "")).strip()
+        candidate_internal_id = str(item.get("id", "")).strip()
+        if (
+            candidate_device_id == needle
+            or candidate_internal_id == needle
+            or candidate_device_id.lower() == needle.lower()
+            or candidate_internal_id.lower() == needle.lower()
+        ):
+            return _normalize_device_payload(item)
+    return None
+
+
+def _resolve_backend_device_identifier(device_id: str) -> str:
+    raw = str(device_id or "").strip()
+    if not raw:
+        return raw
+
+    if _is_object_id(raw):
+        return raw
+
+    listed = list_devices()
+    if not listed.get("ok"):
+        return raw
+
+    for item in listed.get("devices", []):
+        if not isinstance(item, dict):
+            continue
+        item_device_id = str(item.get("deviceId", "")).strip()
+        item_internal_id = str(item.get("id", "")).strip()
+        if item_device_id == raw or item_device_id.lower() == raw.lower():
+            internal_id = str(item.get("id", "")).strip()
+            return internal_id or raw
+        if item_internal_id == raw or item_internal_id.lower() == raw.lower():
+            return raw
+
+    return raw
 
 
 def create_device(
     *,
     name: str,
     type: str,
-    device_id: Optional[str] = None,
+    device_id: str,
 ) -> dict:
-    if not name or not type:
+    if not name or not type or not device_id:
         return {
             "ok": False,
-            "error": "Missing required fields for create_device: name, type",
+            "error": "Missing required fields for create_device: name, device_id, type",
         }
 
     type_value = str(type).strip().lower()
@@ -274,10 +386,9 @@ def create_device(
 
     payload: dict[str, Any] = {
         "name": name,
+        "deviceId": device_id,
         "type": type_value,
     }
-    if device_id:
-        payload["deviceId"] = device_id
 
     response = _call_backend_api("POST", "/device", payload)
     if not response["ok"]:
@@ -285,7 +396,11 @@ def create_device(
 
     device = _extract_device(response["data"])
     if not device:
-        return {"ok": False, "error": "Unexpected backend response for create_device."}
+        return _contract_error(
+            "create_device",
+            response["data"],
+            "Expected a device object in one of: device, data, item, result",
+        )
 
     return {"ok": True, "device": device}
 
@@ -294,13 +409,22 @@ def get_device(device_id: str) -> dict:
     if not device_id:
         return {"ok": False, "error": "Missing required field for get_device: device_id"}
 
-    response = _call_backend_api("GET", f"/device/{device_id}")
+    raw = str(device_id).strip()
+    response = _call_backend_api("GET", f"/device/{raw}")
     if not response["ok"]:
+        if _is_device_id_lookup_error(response.get("error", "")):
+            from_list = _find_device_in_list(raw)
+            if from_list:
+                return {"ok": True, "device": from_list}
         return response
 
     device = _extract_device(response["data"])
     if not device:
-        return {"ok": False, "error": "Unexpected backend response for get_device."}
+        return _contract_error(
+            "get_device",
+            response["data"],
+            "Expected a device object in one of: device, data, item, result",
+        )
 
     return {"ok": True, "device": device}
 
@@ -350,13 +474,20 @@ def update_device(
             ),
         }
 
-    response = _call_backend_api("PATCH", f"/device/{device_id}", payload)
+    resolved = _resolve_backend_device_identifier(device_id)
+    response = _call_backend_api("PATCH", f"/device/{resolved}", payload)
+    if not response["ok"] and resolved != device_id:
+        response = _call_backend_api("PATCH", f"/device/{device_id}", payload)
     if not response["ok"]:
         return response
 
     device = _extract_device(response["data"])
     if not device:
-        return {"ok": False, "error": "Unexpected backend response for update_device."}
+        return _contract_error(
+            "update_device",
+            response["data"],
+            "Expected a device object in one of: device, data, item, result",
+        )
 
     return {"ok": True, "device": device}
 
@@ -365,13 +496,22 @@ def delete_device(device_id: str) -> dict:
     if not device_id:
         return {"ok": False, "error": "Missing required field for delete_device: device_id"}
 
-    response = _call_backend_api("DELETE", f"/device/{device_id}")
+    resolved = _resolve_backend_device_identifier(device_id)
+    response = _call_backend_api("DELETE", f"/device/{resolved}")
+    if not response["ok"] and resolved != device_id:
+        response = _call_backend_api("DELETE", f"/device/{device_id}")
     if not response["ok"]:
         return response
 
     device = _extract_device(response["data"])
     if not device:
-        return {"ok": False, "error": "Unexpected backend response for delete_device."}
+        # Some backends return only status/message on DELETE with no device payload.
+        return {
+            "ok": True,
+            "deleted": True,
+            "device": {"deviceId": device_id},
+            "raw": response["data"],
+        }
 
     return {"ok": True, "deleted": True, "device": device}
 
@@ -382,6 +522,12 @@ def list_devices() -> dict:
         return response
 
     devices = _extract_device_list(response["data"])
+    if not isinstance(devices, list):
+        return _contract_error(
+            "list_devices",
+            response["data"],
+            "Expected a device list in one of: devices, data, items, results, result, List",
+        )
     return {"ok": True, "devices": devices}
 
 
@@ -389,18 +535,22 @@ def execute_tool(tool_data: dict) -> dict:
     tool_name = tool_data.get("name", "").strip()
 
     if tool_name == "create_device":
-        name = tool_data.get("device_name")
-        type_ = tool_data.get("device_type")
-        if not name or not type_:
+        name = str(tool_data.get("device_name", "")).strip()
+        type_ = str(tool_data.get("device_type", "")).strip()
+        device_id = str(tool_data.get("device_id", "")).strip()
+        if not name or not type_ or not device_id:
             return {
                 "ok": False,
-                "error": "Missing required fields for create_device: device_name, device_type",
+                "error": (
+                    "Missing required fields for create_device: "
+                    "device_name, device_id, device_type"
+                ),
             }
 
         return create_device(
             name=name,
             type=type_,
-            device_id=str(tool_data.get("device_id", "")).strip() or None,
+            device_id=device_id,
         )
 
     if tool_name == "get_device":

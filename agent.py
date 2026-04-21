@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import http.client
 import json
 import os
 import urllib.error
@@ -7,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from parser import parse_agent_output
 from device_tools import execute_tool
+
+ALLOWED_DEVICE_TYPES = ["sensor", "gateway", "controller", "processor", "ipcamera"]
 
 
 def _load_dotenv(dotenv_path: str | Path | None = None) -> None:
@@ -41,6 +46,20 @@ MODEL_NAME = os.getenv("MODEL_NAME", "Qwen")
 API_KEY = os.getenv("MODEL_API_KEY", "tensorrt_llm")
 
 
+def _normalize_model_server_url(url: str) -> str:
+    base = (url or "").strip().rstrip("/")
+    if not base:
+        return "http://94.101.135.237:9000/v1/chat/completions"
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1") or base.endswith("/openai/v1"):
+        return f"{base}/chat/completions"
+    return base
+
+
+MODEL_SERVER = _normalize_model_server_url(MODEL_SERVER)
+
+
 SYSTEM_PROMPT = """You are a strict device CRUD agent.
 
 You can do only one of the following:
@@ -57,14 +76,9 @@ question=Your question here
 
 <tool>
 name=create_device
+device_id=dev-1001
 device_name=my-device
 device_type=sensor
-role=temp
-description=Edge temperature sensor
-group=building-a
-save_data=true
-tags=critical,temperature
-features=temperature|Temperature|sensors.temp|C|24.2
 </tool>
 
 3) After receiving tool result, respond with a short plain text answer only.
@@ -84,9 +98,8 @@ Rules:
 - If required information is missing, ask the user
 - In ask blocks, include the intended tool name in the tool field
 - If enough information exists, call exactly one tool
-- For create_device required fields are: device_name, device_type
+- For create_device required fields are: device_name, device_id, device_type
 - Allowed device_type values: sensor, gateway, controller, processor, ipcamera
-- Optional create_device field: device_id
 - For update_device required field is: device_id and at least one of device_name, device_type, role, description, group, save_data, status, tags, features
 - For delete_device required field is: device_id
 - For get_device required field is: device_id
@@ -124,6 +137,8 @@ def call_model(messages: List[Dict[str, str]]) -> str:
         ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Model server request failed: {exc.reason}") from exc
+    except (http.client.RemoteDisconnected, ConnectionError, TimeoutError) as exc:
+        raise RuntimeError(f"Model server connection failed: {exc}") from exc
 
     data = json.loads(response_body)
     return data["choices"][0]["message"]["content"]
@@ -134,10 +149,15 @@ def build_fe_response(
     context: Dict[str, Any],
     message: str,
     actions: List[Dict[str, Any]],
+    data: Optional[Any] = None,
     need_more_info: bool = False,
     missing_fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    payload_data = data
+    if payload_data is None:
+        payload_data = context.get("data", {})
     return {
+        "data": payload_data,
         "context": context,
         "message": message,
         "actions": actions,
@@ -146,14 +166,82 @@ def build_fe_response(
     }
 
 
+def _build_create_form_action(
+    missing_fields: list[str],
+    current_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    values = current_data or {}
+    return {
+        "type": "form",
+        "tool": "create_device",
+        "title": "Create New Device",
+        "submit_label": "Create Device",
+        "fields": [
+            {
+                "name": "device_name",
+                "label": "Device Name",
+                "input_type": "text",
+                "required": True,
+                "value": str(values.get("device_name", "")),
+                "is_missing": "device_name" in missing_fields,
+            },
+            {
+                "name": "device_id",
+                "label": "Device ID",
+                "input_type": "text",
+                "required": True,
+                "value": str(values.get("device_id", "")),
+                "is_missing": "device_id" in missing_fields,
+            },
+            {
+                "name": "device_type",
+                "label": "Device Type",
+                "input_type": "select",
+                "required": True,
+                "value": str(values.get("device_type", "")),
+                "options": [{"label": v, "value": v} for v in ALLOWED_DEVICE_TYPES],
+                "is_missing": "device_type" in missing_fields,
+            },
+        ],
+    }
+
+
+def build_missing_info_actions(
+    *,
+    tool_name: Optional[str],
+    missing_fields: list[str],
+    current_data: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, Any]]:
+    if tool_name == "create_device":
+        return [_build_create_form_action(missing_fields, current_data)]
+    return []
+
+
 def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
     if not tool_result.get("ok"):
+        error_message = tool_result.get("error", "Tool execution failed.")
+        if tool_name == "create_device" and "invalid device type" in str(error_message).lower():
+            return build_fe_response(
+                context={"entity": "device", "data": {}},
+                message=(
+                    "Invalid device type. Allowed values are: "
+                    + ", ".join(ALLOWED_DEVICE_TYPES)
+                ),
+                actions=build_missing_info_actions(
+                    tool_name="create_device",
+                    missing_fields=["device_type"],
+                    current_data={},
+                ),
+                need_more_info=True,
+                missing_fields=["device_type"],
+            )
         return build_fe_response(
             context={
                 "entity": "device",
                 "data": tool_result,
             },
-            message=tool_result.get("error", "Tool execution failed."),
+            data={"result": tool_result},
+            message=error_message,
             actions=[],
             need_more_info=False,
             missing_fields=[],
@@ -161,7 +249,6 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "create_device":
         device = tool_result["device"]
-        device_target_id = device.get("deviceId") or device.get("id", "")
         return build_fe_response(
             context={
                 "entity": "device",
@@ -170,17 +257,36 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             message="Device created successfully.",
             actions=[
                 {
-                    "type": "button",
-                    "label": "Go To Device",
+                    "kind": "navigate",
+                    "destination": {
+                        "screen": "resource_detail",
+                        "resource": "device",
+                        "idFrom": "data.device.id",
+                    },
+                    "label": "Open device detail",
                     "variant": "success",
-                    "target": f"/devices/{device_target_id}",
+                },
+                {
+                    "kind": "show_list",
+                    "resource": "device",
+                    "label": "Back to devices",
+                    "variant": "secondary",
+                },
+                {
+                    "kind": "confirm",
+                    "label": "Create connector",
+                    "target": "CreateDeviceConnector",
+                    "confirmKey": "create_device_connector",
+                    "title": "Create connector",
+                    "message": "Do you want to create a connector for this device now?",
+                    "variant": "primary",
                 }
             ],
+            data={"device": device},
         )
 
     if tool_name == "get_device":
         device = tool_result["device"]
-        device_target_id = device.get("deviceId") or device.get("id", "")
         return build_fe_response(
             context={
                 "entity": "device",
@@ -189,17 +295,27 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             message="Device fetched successfully.",
             actions=[
                 {
-                    "type": "button",
-                    "label": "View Device",
+                    "kind": "navigate",
+                    "destination": {
+                        "screen": "resource_edit",
+                        "resource": "device",
+                        "idFrom": "data.device.id",
+                    },
+                    "label": "Edit device",
                     "variant": "primary",
-                    "target": f"/devices/{device_target_id}",
+                },
+                {
+                    "kind": "show_list",
+                    "resource": "device",
+                    "label": "Back to devices",
+                    "variant": "secondary",
                 }
             ],
+            data={"device": device},
         )
 
     if tool_name == "update_device":
         device = tool_result["device"]
-        device_target_id = device.get("deviceId") or device.get("id", "")
         return build_fe_response(
             context={
                 "entity": "device",
@@ -208,12 +324,23 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             message="Device updated successfully.",
             actions=[
                 {
-                    "type": "button",
-                    "label": "Go To Device",
+                    "kind": "navigate",
+                    "destination": {
+                        "screen": "resource_detail",
+                        "resource": "device",
+                        "idFrom": "data.device.id",
+                    },
+                    "label": "Open updated device",
                     "variant": "success",
-                    "target": f"/devices/{device_target_id}",
+                },
+                {
+                    "kind": "show_list",
+                    "resource": "device",
+                    "label": "Back to devices",
+                    "variant": "secondary",
                 }
             ],
+            data={"device": device},
         )
 
     if tool_name == "delete_device":
@@ -226,12 +353,22 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             message="Device deleted successfully.",
             actions=[
                 {
-                    "type": "button",
-                    "label": "Go To Devices",
-                    "variant": "warning",
-                    "target": "/devices",
+                    "kind": "show_list",
+                    "resource": "device",
+                    "label": "Back to devices",
+                    "variant": "primary",
+                },
+                {
+                    "kind": "navigate",
+                    "destination": {
+                        "screen": "resource_create",
+                        "resource": "device",
+                    },
+                    "label": "Create a new device",
+                    "variant": "secondary",
                 }
             ],
+            data={"device": device},
         )
 
     if tool_name == "list_devices":
@@ -244,12 +381,16 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             message=f"{len(devices)} device(s) found.",
             actions=[
                 {
-                    "type": "button",
-                    "label": "Open Devices List",
+                    "kind": "navigate",
+                    "destination": {
+                        "screen": "resource_create",
+                        "resource": "device",
+                    },
+                    "label": "Create device",
                     "variant": "primary",
-                    "target": "/devices",
                 }
             ],
+            data={"devices": devices},
         )
 
     return build_fe_response(
@@ -257,6 +398,7 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             "entity": "device",
             "data": tool_result,
         },
+        data={"result": tool_result},
         message="Operation completed.",
         actions=[],
     )
@@ -274,15 +416,21 @@ def run_agent(user_text: str, max_turns: int = 3) -> dict:
 
         if parsed["kind"] == "ask":
             question = parsed["data"].get("question", "Please provide more information.")
+            ask_tool = parsed["data"].get("tool")
+            missing_fields = parsed.get("missing_fields", [])
             return build_fe_response(
                 context={
                     "entity": "device",
                     "data": {},
                 },
                 message=question,
-                actions=[],
+                actions=build_missing_info_actions(
+                    tool_name=ask_tool,
+                    missing_fields=missing_fields,
+                    current_data={},
+                ),
                 need_more_info=True,
-                missing_fields=parsed.get("missing_fields", []),
+                missing_fields=missing_fields,
             )
 
         if parsed["kind"] == "tool":

@@ -3,7 +3,7 @@ from agent_session import DeviceAgentSession
 
 
 if __name__ == "__main__":
-    session = DeviceAgentSession()
+    chat_history: list[dict] = []
     while True:
         user_text = input("\nUSER: ").strip()
 
@@ -11,6 +11,6 @@ if __name__ == "__main__":
             print("Bye.")
             break
 
-        result = session.run_turn(user_text)
+        result, chat_history = DeviceAgentSession.run_turn_stateless(user_text, chat_history)
         print("\nAGENT RESPONSE:")
         print(json.dumps(result, ensure_ascii=False, indent=2))

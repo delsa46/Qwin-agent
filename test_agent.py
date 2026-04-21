@@ -199,9 +199,11 @@ def test_run_agent_create_device(mock_call_model, mock_http):
     assert result["context"]["entity"] == "device"
     assert result["context"]["data"]["name"] == "sensor-a"
     assert result["context"]["data"]["deviceId"] == "device-001"
-    assert len(result["actions"]) == 1
-    assert result["actions"][0]["label"] == "Go To Device"
-    assert result["actions"][0]["target"] == "/devices/device-001"
+    assert result["data"]["device"]["deviceId"] == "device-001"
+    assert len(result["actions"]) == 3
+    assert result["actions"][0]["kind"] == "navigate"
+    assert result["actions"][0]["destination"]["screen"] == "resource_detail"
+    assert result["actions"][0]["destination"]["idFrom"] == "data.device.id"
 
 
 @patch("agent.call_model")
@@ -329,7 +331,9 @@ def test_session_direct_create_from_plain_text(mock_http):
     assert result["context"]["data"]["role"] == "network"
     assert result["context"]["data"]["group"]["name"] == "building-a"
     assert result["context"]["data"]["tags"][0]["name"] == "network"
-    assert result["actions"][0]["target"].startswith("/devices/dev-")
+    assert result["actions"][0]["kind"] == "navigate"
+    assert result["actions"][0]["destination"]["screen"] == "resource_detail"
+    assert result["actions"][0]["destination"]["idFrom"] == "data.device.id"
 
 
 @patch("agent_session.call_model")
