@@ -1,9 +1,35 @@
 from unittest.mock import patch
 
-from agent import map_tool_result_to_fe
+from agent import map_tool_result_to_fe, run_agent
 from agent_session import DeviceAgentSession
 from device_tools import BackendRequestError
 from device_tools import execute_tool
+
+
+@patch("agent.call_model")
+@patch("device_tools._http_request")
+def test_model_tool_block_is_reselected_before_execute(mock_http, mock_call_model):
+    mock_call_model.return_value = (
+        "<tool>\n"
+        "name=get_device\n"
+        "device_name=sensor-a\n"
+        "device_id=dev-100\n"
+        "device_type=sensor\n"
+        "</tool>"
+    )
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "dev-100",
+            "name": "sensor-a",
+            "type": "sensor",
+        }
+    }
+
+    result = run_agent("create a new device")
+
+    assert result["need_more_info"] is False
+    assert "created successfully" in result["message"].lower()
+    assert result["context"]["data"]["deviceId"] == "dev-100"
 
 
 @patch("device_tools._http_request")
@@ -151,16 +177,31 @@ def test_get_without_id_asks_without_model(mock_call_model):
 @patch("device_tools._http_request")
 def test_delete_with_typo_intent_and_free_text_id(mock_http, mock_call_model):
     mock_call_model.side_effect = RuntimeError("model should not be called")
-    mock_http.return_value = {
-        "device": {"deviceId": "444555666", "name": "sensor-z", "type": "gateway"}
-    }
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device/444555666":
+            return {
+                "device": {"deviceId": "444555666", "name": "sensor-z", "type": "gateway"}
+            }
+        if method == "DELETE" and path == "/device/444555666":
+            return {
+                "device": {"deviceId": "444555666", "name": "sensor-z", "type": "gateway"}
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
+
+    mock_http.side_effect = fake_http
 
     session = DeviceAgentSession()
     result = session.run_turn("delet device id is 444555666")
 
-    assert result["need_more_info"] is False
-    assert "deleted successfully" in result["message"].lower()
-    assert result["context"]["data"]["deviceId"] == "444555666"
+    assert result["need_more_info"] is True
+    assert result["actions"][0]["kind"] == "confirm"
+    assert result["actions"][0]["confirmKey"] == "delete_device"
+    assert "444555666" in result["message"]
+
+    confirmed = session.run_turn("__confirm__:delete_device")
+    assert confirmed["need_more_info"] is False
+    assert "deleted successfully" in confirmed["message"].lower()
+    assert confirmed["context"]["data"]["deviceId"] == "444555666"
 
 
 @patch("agent_session.call_model")
@@ -333,6 +374,44 @@ def test_stateless_get_retry_keeps_intent_after_invalid_device_id(mock_http):
 
 
 @patch("device_tools._http_request")
+def test_get_device_from_ui_style_message_sends_device_id_to_backend(mock_http):
+    called = []
+
+    def fake_http(method, path, payload=None):
+        called.append((method, path, payload))
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd799439211",
+                        "deviceId": "14141414",
+                        "name": "sensor-1414",
+                        "type": "sensor",
+                    }
+                ]
+            }
+        if method == "GET" and path == "/device/507f1f77bcf86cd799439211":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd799439211",
+                    "deviceId": "14141414",
+                    "name": "sensor-1414",
+                    "type": "sensor",
+                }
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
+
+    mock_http.side_effect = fake_http
+
+    result = DeviceAgentSession().run_turn("get device device_id=14141414")
+
+    assert result["need_more_info"] is False
+    assert result["context"]["data"]["deviceId"] == "14141414"
+    assert ("GET", "/device", None) in called
+    assert ("GET", "/device/507f1f77bcf86cd799439211", None) in called
+
+
+@patch("device_tools._http_request")
 def test_delete_by_text_device_id_resolves_to_internal_object_id(mock_http):
     internal_id = "507f1f77bcf86cd799439011"
     public_id = "ai-dev-1776705850"
@@ -394,18 +473,20 @@ def test_actions_use_ui_action_contract_for_crud_results():
     assert create["data"]["device"]["deviceId"] == "d1"
     assert create["actions"][0]["kind"] == "navigate"
     assert create["actions"][0]["destination"]["screen"] == "resource_detail"
-    assert create["actions"][0]["destination"]["idFrom"] == "data.device.id"
+    assert create["actions"][0]["destination"]["idFrom"] == "data.device.deviceId"
     assert create["actions"][1]["kind"] == "show_list"
     assert create["actions"][2]["kind"] == "confirm"
 
     assert get_one["actions"][0]["kind"] == "navigate"
+    assert get_one["actions"][0]["operationId"] == "UpdateDevice"
     assert get_one["actions"][0]["destination"]["screen"] == "resource_edit"
-    assert get_one["actions"][0]["destination"]["idFrom"] == "data.device.id"
+    assert get_one["actions"][0]["destination"]["idFrom"] == "data.device.deviceId"
     assert get_one["actions"][1]["kind"] == "show_list"
 
     assert update["actions"][0]["kind"] == "navigate"
+    assert update["actions"][0]["operationId"] == "GetDeviceById"
     assert update["actions"][0]["destination"]["screen"] == "resource_detail"
-    assert update["actions"][0]["destination"]["idFrom"] == "data.device.id"
+    assert update["actions"][0]["destination"]["idFrom"] == "data.device.deviceId"
     assert update["actions"][1]["kind"] == "show_list"
 
     assert delete["actions"][0]["kind"] == "show_list"
@@ -449,8 +530,12 @@ def test_session_delete_keeps_full_ai_dev_identifier_and_resolves(mock_http):
     session.run_turn("delete device")
     result = session.run_turn(public_id)
 
-    assert result["need_more_info"] is False
-    assert "deleted successfully" in result["message"].lower()
+    assert result["need_more_info"] is True
+    assert result["actions"][0]["confirmKey"] == "delete_device"
+
+    confirmed = session.run_turn("__confirm__:delete_device")
+    assert confirmed["need_more_info"] is False
+    assert "deleted successfully" in confirmed["message"].lower()
 
 
 @patch("device_tools._http_request")
@@ -494,9 +579,13 @@ def test_delete_success_when_backend_returns_no_device_payload(mock_http):
     session.run_turn("delete device")
     result = session.run_turn("1919191919")
 
-    assert result["need_more_info"] is False
-    assert "deleted successfully" in result["message"].lower()
-    assert result["context"]["data"]["deviceId"] == "1919191919"
+    assert result["need_more_info"] is True
+    assert result["actions"][0]["confirmKey"] == "delete_device"
+
+    confirmed = session.run_turn("__confirm__:delete_device")
+    assert confirmed["need_more_info"] is False
+    assert "deleted successfully" in confirmed["message"].lower()
+    assert confirmed["context"]["data"]["deviceId"] == "1919191919"
 
 
 @patch("device_tools._http_request")
@@ -605,6 +694,41 @@ def test_create_understands_inverted_name_and_type_sentence(mock_http):
     result = session.run_turn("__action__:CreateDevice")
     assert result["need_more_info"] is False
     assert result["context"]["data"]["name"] == "sensor"
+    assert result["context"]["data"]["type"] == "gateway"
+
+
+@patch("device_tools._http_request")
+def test_create_preserves_device_name_with_spaces(mock_http):
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "sensor-10-id",
+            "name": "sensor 10",
+            "type": "sensor",
+        }
+    }
+    session = DeviceAgentSession()
+
+    result = session.run_turn("create device name is sensor 10 id is sensor-10-id type is sensor")
+
+    assert result["need_more_info"] is False
+    assert result["context"]["data"]["name"] == "sensor 10"
+
+
+@patch("device_tools._http_request")
+def test_create_preserves_device_name_with_spaces_before_and_type(mock_http):
+    mock_http.return_value = {
+        "device": {
+            "deviceId": "a1",
+            "name": "sensor 10",
+            "type": "gateway",
+        }
+    }
+    session = DeviceAgentSession()
+
+    result = session.run_turn("create device id is a1 name is sensor 10 and type is gateway")
+
+    assert result["need_more_info"] is False
+    assert result["context"]["data"]["name"] == "sensor 10"
     assert result["context"]["data"]["type"] == "gateway"
 
 

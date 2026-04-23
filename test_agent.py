@@ -1,9 +1,11 @@
+import json
+
 import pytest
 from unittest.mock import MagicMock, patch
 
 from parser import extract_block, is_pure_block, parse_key_value_block, parse_agent_output
 from device_tools import BackendRequestError, execute_tool
-from agent import run_agent
+from agent import call_model, run_agent
 from agent_session import DeviceAgentSession
 
 
@@ -13,7 +15,7 @@ def default_backend_mock(monkeypatch):
     default_device = {
         "deviceId": "dev-default",
         "name": "sensor-default",
-        "type": "temperature",
+        "type": "sensor",
         "group": "building-a",
         "tags": ["default"],
     }
@@ -65,28 +67,59 @@ def test_parse_agent_output_ask():
     assert result["missing_fields"] == ["device_name", "device_type"]
 
 
+@patch("urllib.request.urlopen")
+def test_call_model_sends_reasoning_effort_default(mock_urlopen):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {"message": {"content": "ok"}}
+                    ]
+                }
+            ).encode("utf-8")
+
+    captured = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    mock_urlopen.side_effect = fake_urlopen
+
+    result = call_model([{"role": "user", "content": "hello"}])
+
+    assert result == "ok"
+    assert captured["body"]["reasoning_effort"] == "default"
+
+
 @patch("device_tools._http_request")
 def test_execute_tool_create_device(mock_http):
     mock_http.return_value = {
         "device": {
             "deviceId": "device-001",
             "name": "sensor-a",
-            "type": "temperature",
+            "type": "sensor",
         }
     }
 
     result = execute_tool({
         "name": "create_device",
         "device_name": "sensor-a",
-        "device_type": "temperature",
+        "device_type": "sensor",
         "device_id": "device-001",
     })
 
     assert result["ok"] is True
     assert result["device"]["name"] == "sensor-a"
     assert result["device"]["deviceId"] == "device-001"
-    assert result["device"]["saveData"] is True
-    assert result["device"]["tags"][0]["name"] == "critical"
+    assert result["device"]["type"] == "sensor"
 
 
 @patch("device_tools._http_request")
@@ -96,7 +129,8 @@ def test_execute_tool_create_backend_error(mock_http):
     result = execute_tool({
         "name": "create_device",
         "device_name": "sensor-a",
-        "device_type": "temperature",
+        "device_type": "sensor",
+        "device_id": "device-001",
     })
 
     assert result["ok"] is False
@@ -105,13 +139,31 @@ def test_execute_tool_create_backend_error(mock_http):
 
 @patch("device_tools._http_request")
 def test_execute_tool_get_device(mock_http):
-    mock_http.return_value = {
-        "deviceId": "device-002",
-        "name": "sensor-b",
-        "type": "humidity",
-        "group": "floor-1",
-        "tags": ["indoor"],
-    }
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd799439022",
+                        "deviceId": "device-002",
+                        "name": "sensor-b",
+                        "type": "humidity",
+                        "group": "floor-1",
+                        "tags": ["indoor"],
+                    }
+                ]
+            }
+        if method == "GET" and path == "/device/507f1f77bcf86cd799439022":
+            return {
+                "deviceId": "device-002",
+                "name": "sensor-b",
+                "type": "humidity",
+                "group": "floor-1",
+                "tags": ["indoor"],
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
+
+    mock_http.side_effect = fake_http
 
     result = execute_tool({"name": "get_device", "device_id": "device-002"})
 
@@ -182,18 +234,18 @@ def test_run_agent_create_device(mock_call_model, mock_http):
         "name=create_device\n"
         "device_id=device-001\n"
         "device_name=sensor-a\n"
-        "device_type=temperature\n"
+        "device_type=sensor\n"
         "</tool>"
     )
     mock_http.return_value = {
         "device": {
             "deviceId": "device-001",
             "name": "sensor-a",
-            "type": "temperature",
+            "type": "sensor",
         }
     }
 
-    result = run_agent("create a device named sensor-a of type temperature")
+    result = run_agent("create a device named sensor-a of type sensor")
 
     assert result["message"] == "Device created successfully."
     assert result["context"]["entity"] == "device"
@@ -203,7 +255,7 @@ def test_run_agent_create_device(mock_call_model, mock_http):
     assert len(result["actions"]) == 3
     assert result["actions"][0]["kind"] == "navigate"
     assert result["actions"][0]["destination"]["screen"] == "resource_detail"
-    assert result["actions"][0]["destination"]["idFrom"] == "data.device.id"
+    assert result["actions"][0]["destination"]["idFrom"] == "data.device.deviceId"
 
 
 @patch("agent.call_model")
@@ -235,7 +287,7 @@ def test_run_agent_list_devices(mock_call_model, mock_http):
             {
                 "deviceId": "device-010",
                 "name": "sensor-list",
-                "type": "temperature",
+                "type": "sensor",
             }
         ]
     }
@@ -269,7 +321,7 @@ def test_session_followup_create_with_missing_fields(mock_http, mock_call_model)
         "device": {
             "deviceId": "device-006",
             "name": "sensor-a",
-            "type": "temperature",
+            "type": "sensor",
             "group": "building-a",
             "tags": ["critical"],
         }
@@ -278,13 +330,19 @@ def test_session_followup_create_with_missing_fields(mock_http, mock_call_model)
     session = DeviceAgentSession()
     first = session.run_turn("create a device")
     assert first["need_more_info"] is True
-    assert first["missing_fields"] == ["device_name", "device_type"]
+    assert first["missing_fields"] == ["device_name", "device_id", "device_type"]
 
-    second = session.run_turn("sensor-a,temperature")
-    assert second["message"] == "Device created successfully."
-    assert second["context"]["entity"] == "device"
-    assert second["context"]["data"]["name"] == "sensor-a"
-    assert second["context"]["data"]["type"] == "temperature"
+    second = session.run_turn(
+        "device_name=sensor-a,device_id=device-006,device_type=sensor"
+    )
+    assert second["need_more_info"] is True
+    assert second["actions"][0]["target"] == "CreateDevice"
+
+    third = session.run_turn("__action__:CreateDevice")
+    assert third["message"] == "Device created successfully."
+    assert third["context"]["entity"] == "device"
+    assert third["context"]["data"]["name"] == "sensor-a"
+    assert third["context"]["data"]["type"] == "sensor"
 
 
 @patch("device_tools._http_request")
@@ -301,7 +359,9 @@ def test_session_create_does_not_require_optional_fields(mock_http):
     }
 
     session = DeviceAgentSession()
-    result = session.run_turn("create device name is sensor-1 and typy is gateway")
+    result = session.run_turn(
+        "create device name is sensor-1 and device id is device-007 and typy is gateway"
+    )
 
     assert result["need_more_info"] is False
     assert result["message"] == "Device created successfully."
@@ -321,7 +381,9 @@ def test_session_direct_create_from_plain_text(mock_http):
     }
 
     session = DeviceAgentSession()
-    result = session.run_turn("create device name is sensor-1 and typy is gateway")
+    result = session.run_turn(
+        "create device name is sensor-1 and device id is dev-1234567890 and typy is gateway"
+    )
 
     assert result["need_more_info"] is False
     assert result["message"] == "Device created successfully."
@@ -333,7 +395,7 @@ def test_session_direct_create_from_plain_text(mock_http):
     assert result["context"]["data"]["tags"][0]["name"] == "network"
     assert result["actions"][0]["kind"] == "navigate"
     assert result["actions"][0]["destination"]["screen"] == "resource_detail"
-    assert result["actions"][0]["destination"]["idFrom"] == "data.device.id"
+    assert result["actions"][0]["destination"]["idFrom"] == "data.device.deviceId"
 
 
 @patch("agent_session.call_model")
@@ -346,31 +408,33 @@ def test_session_get_flow_with_followup(mock_http, mock_call_model):
         "question=Please provide device_id.\n"
         "</ask>"
     )
-    mock_http.side_effect = [
-        {
-            "device": {
-                "deviceId": "device-008",
-                "name": "sensor-r1",
-                "type": "temp",
-                "group": "floor-1",
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd799439008",
+                        "deviceId": "device-008",
+                        "name": "sensor-r1",
+                        "type": "sensor",
+                        "group": "floor-1",
+                    }
+                ]
             }
-        },
-        {
-            "device": {
-                "deviceId": "device-008",
-                "name": "sensor-r1",
-                "type": "temp",
-                "group": "floor-1",
+        if method == "GET" and path == "/device/507f1f77bcf86cd799439008":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd799439008",
+                    "deviceId": "device-008",
+                    "name": "sensor-r1",
+                    "type": "sensor",
+                    "group": "floor-1",
+                }
             }
-        },
-    ]
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-r1",
-        "device_type": "temp",
-    })
-    device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+    device_id = "device-008"
 
     session = DeviceAgentSession()
     first = session.run_turn("get device details")
@@ -392,35 +456,48 @@ def test_session_update_flow_with_followup(mock_http, mock_call_model):
         "question=Please provide device_id and status.\n"
         "</ask>"
     )
-    mock_http.side_effect = [
-        {
-            "device": {
-                "deviceId": "device-009",
-                "name": "sensor-u1",
-                "type": "temp",
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd799439009",
+                        "deviceId": "device-009",
+                        "name": "sensor-u1",
+                        "type": "sensor",
+                        "status": True,
+                    }
+                ]
             }
-        },
-        {
-            "device": {
-                "deviceId": "device-009",
-                "name": "sensor-u1",
-                "type": "temp",
-                "status": False,
+        if method == "GET" and path == "/device/507f1f77bcf86cd799439009":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd799439009",
+                    "deviceId": "device-009",
+                    "name": "sensor-u1",
+                    "type": "sensor",
+                    "status": True,
+                }
             }
-        },
-    ]
+        if method == "PATCH" and path == "/device/507f1f77bcf86cd799439009":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd799439009",
+                    "deviceId": "device-009",
+                    "name": "sensor-u1",
+                    "type": "sensor",
+                    "status": False,
+                }
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-u1",
-        "device_type": "temp",
-    })
-    device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+    device_id = "device-009"
 
     session = DeviceAgentSession()
     first = session.run_turn("update device")
     assert first["need_more_info"] is True
-    assert first["missing_fields"] == ["device_id", "status"]
+    assert first["missing_fields"] == ["device_id"]
 
     second = session.run_turn(f"device_id={device_id},status=inactive")
     assert second["message"] == "Device updated successfully."
@@ -438,30 +515,41 @@ def test_session_update_requires_payload_after_device_id(mock_http, mock_call_mo
         "question=Please provide the device ID to update\n"
         "</ask>"
     )
-    mock_http.side_effect = [
-        {
-            "device": {
-                "deviceId": "device-up-1",
-                "name": "sensor-up-1",
-                "type": "gateway",
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd7994390aa",
+                        "deviceId": "device-up-1",
+                        "name": "sensor-up-1",
+                        "type": "gateway",
+                    }
+                ]
             }
-        },
-        {
-            "device": {
-                "deviceId": "device-up-1",
-                "name": "sensor-up-1",
-                "type": "gateway",
-                "status": False,
+        if method == "GET" and path == "/device/507f1f77bcf86cd7994390aa":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390aa",
+                    "deviceId": "device-up-1",
+                    "name": "sensor-up-1",
+                    "type": "gateway",
+                }
             }
-        },
-    ]
+        if method == "PATCH" and path == "/device/507f1f77bcf86cd7994390aa":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390aa",
+                    "deviceId": "device-up-1",
+                    "name": "sensor-up-1",
+                    "type": "gateway",
+                    "status": False,
+                }
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-up-1",
-        "device_type": "gateway",
-    })
-    device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+    device_id = "device-up-1"
 
     session = DeviceAgentSession()
     first = session.run_turn("update device")
@@ -480,7 +568,8 @@ def test_session_update_requires_payload_after_device_id(mock_http, mock_call_mo
 
 
 @patch("agent_session.call_model")
-def test_session_delete_flow_with_followup(mock_call_model):
+@patch("device_tools._http_request")
+def test_session_delete_flow_with_followup(mock_http, mock_call_model):
     mock_call_model.return_value = (
         "<ask>\n"
         "tool=delete_device\n"
@@ -488,13 +577,28 @@ def test_session_delete_flow_with_followup(mock_call_model):
         "question=Please provide device_id.\n"
         "</ask>"
     )
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device/sensor-d1":
+            return {
+                "device": {
+                    "deviceId": "sensor-d1",
+                    "name": "sensor-d1",
+                    "type": "gateway",
+                }
+            }
+        if method == "DELETE" and path == "/device/sensor-d1":
+            return {
+                "device": {
+                    "deviceId": "sensor-d1",
+                    "name": "sensor-d1",
+                    "type": "gateway",
+                }
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-d1",
-        "device_type": "temp",
-    })
-    device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+
+    device_id = "sensor-d1"
 
     session = DeviceAgentSession()
     first = session.run_turn("delete device")
@@ -502,8 +606,15 @@ def test_session_delete_flow_with_followup(mock_call_model):
     assert first["missing_fields"] == ["device_id"]
 
     second = session.run_turn(device_id)
-    assert second["message"] == "Device deleted successfully."
+    assert second["need_more_info"] is True
+    assert second["actions"][0]["kind"] == "confirm"
+    assert second["actions"][0]["confirmKey"] == "delete_device"
     assert second["context"]["data"]["deviceId"] == device_id
+
+    third = session.run_turn("__confirm__:delete_device")
+    assert third["need_more_info"] is False
+    assert third["message"] == "Device deleted successfully."
+    assert third["context"]["data"]["deviceId"] == device_id
 
 
 @patch("agent_session.call_model")
@@ -516,30 +627,33 @@ def test_session_delete_invalid_id_then_retry_success(mock_http, mock_call_model
         "question=Please provide device_id.\n"
         "</ask>"
     )
-    mock_http.side_effect = [
-        {
-            "device": {
-                "deviceId": "device-del-1",
-                "name": "sensor-del-1",
-                "type": "gateway",
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd7994390bb",
+                        "deviceId": "device-del-1",
+                        "name": "sensor-del-1",
+                        "type": "gateway",
+                    }
+                ]
             }
-        },
-        BackendRequestError("Backend request failed (404): Device 'dev-not-exists' not found."),
-        {
-            "device": {
-                "deviceId": "device-del-1",
-                "name": "sensor-del-1",
-                "type": "gateway",
+        if method == "DELETE" and path == "/device/dev-not-exists":
+            raise BackendRequestError("Backend request failed (404): Device 'dev-not-exists' not found.")
+        if method == "DELETE" and path == "/device/507f1f77bcf86cd7994390bb":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390bb",
+                    "deviceId": "device-del-1",
+                    "name": "sensor-del-1",
+                    "type": "gateway",
+                }
             }
-        },
-    ]
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-del-1",
-        "device_type": "gateway",
-    })
-    valid_device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+    valid_device_id = "device-del-1"
 
     session = DeviceAgentSession()
     first = session.run_turn("delete device")
@@ -549,11 +663,16 @@ def test_session_delete_invalid_id_then_retry_success(mock_http, mock_call_model
     second = session.run_turn("dev-not-exists")
     assert second["need_more_info"] is True
     assert second["missing_fields"] == ["device_id"]
-    assert "Please provide a valid device_id." in second["message"]
+    assert "please provide a valid device_id" in second["message"].lower()
 
     third = session.run_turn(valid_device_id)
-    assert third["need_more_info"] is False
-    assert third["message"] == "Device deleted successfully."
+    assert third["need_more_info"] is True
+    assert third["actions"][0]["kind"] == "confirm"
+    assert third["actions"][0]["confirmKey"] == "delete_device"
+
+    fourth = session.run_turn("__confirm__:delete_device")
+    assert fourth["need_more_info"] is False
+    assert fourth["message"] == "Device deleted successfully."
 
 
 @patch("agent_session.call_model")
@@ -577,17 +696,25 @@ def test_session_create_followup_normalizes_name_and_type(mock_http, mock_call_m
     session = DeviceAgentSession()
     first = session.run_turn("create device")
     assert first["need_more_info"] is True
-    assert first["missing_fields"] == ["device_name", "device_type"]
+    assert first["missing_fields"] == ["device_name", "device_id", "device_type"]
 
     second = session.run_turn("name is sensor-2")
     assert second["need_more_info"] is True
     assert second["context"]["data"]["device_name"] == "sensor-2"
 
-    third = session.run_turn("type is gateway")
-    assert third["need_more_info"] is False
-    assert third["message"] == "Device created successfully."
-    assert third["context"]["data"]["name"] == "sensor-2"
-    assert third["context"]["data"]["type"] == "gateway"
+    third = session.run_turn("device id is device-2")
+    assert third["need_more_info"] is True
+    assert third["missing_fields"] == ["device_type"]
+
+    fourth = session.run_turn("type is gateway")
+    assert fourth["need_more_info"] is True
+    assert fourth["actions"][0]["target"] == "CreateDevice"
+
+    fifth = session.run_turn("__action__:CreateDevice")
+    assert fifth["need_more_info"] is False
+    assert fifth["message"] == "Device created successfully."
+    assert fifth["context"]["data"]["name"] == "sensor-2"
+    assert fifth["context"]["data"]["type"] == "gateway"
 
 
 @patch("agent_session.call_model")
@@ -600,29 +727,40 @@ def test_session_update_name_does_not_change_type(mock_http, mock_call_model):
         "question=Please provide device_id and new name\n"
         "</ask>"
     )
-    mock_http.side_effect = [
-        {
-            "device": {
-                "deviceId": "device-old",
-                "name": "sensor-old",
-                "type": "gateway",
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd7994390cc",
+                        "deviceId": "device-old",
+                        "name": "sensor-old",
+                        "type": "gateway",
+                    }
+                ]
             }
-        },
-        {
-            "device": {
-                "deviceId": "device-old",
-                "name": "sensor-new",
-                "type": "gateway",
+        if method == "GET" and path == "/device/507f1f77bcf86cd7994390cc":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390cc",
+                    "deviceId": "device-old",
+                    "name": "sensor-old",
+                    "type": "gateway",
+                }
             }
-        },
-    ]
+        if method == "PATCH" and path == "/device/507f1f77bcf86cd7994390cc":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390cc",
+                    "deviceId": "device-old",
+                    "name": "sensor-new",
+                    "type": "gateway",
+                }
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-old",
-        "device_type": "gateway",
-    })
-    device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+    device_id = "device-old"
 
     session = DeviceAgentSession()
     first = session.run_turn("update device name")
@@ -648,29 +786,40 @@ def test_session_update_name_with_key_value_does_not_override_type(mock_http, mo
         "question=Please provide device_id and update fields\n"
         "</ask>"
     )
-    mock_http.side_effect = [
-        {
-            "device": {
-                "deviceId": "device-3",
-                "name": "sensor-3",
-                "type": "gateway",
+    def fake_http(method, path, payload=None):
+        if method == "GET" and path == "/device":
+            return {
+                "devices": [
+                    {
+                        "id": "507f1f77bcf86cd7994390dd",
+                        "deviceId": "device-3",
+                        "name": "sensor-3",
+                        "type": "gateway",
+                    }
+                ]
             }
-        },
-        {
-            "device": {
-                "deviceId": "device-3",
-                "name": "sensor-4",
-                "type": "gateway",
+        if method == "GET" and path == "/device/507f1f77bcf86cd7994390dd":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390dd",
+                    "deviceId": "device-3",
+                    "name": "sensor-3",
+                    "type": "gateway",
+                }
             }
-        },
-    ]
+        if method == "PATCH" and path == "/device/507f1f77bcf86cd7994390dd":
+            return {
+                "device": {
+                    "id": "507f1f77bcf86cd7994390dd",
+                    "deviceId": "device-3",
+                    "name": "sensor-4",
+                    "type": "gateway",
+                }
+            }
+        raise AssertionError(f"Unexpected request: {(method, path, payload)}")
 
-    created = execute_tool({
-        "name": "create_device",
-        "device_name": "sensor-3",
-        "device_type": "gateway",
-    })
-    device_id = created["device"]["deviceId"]
+    mock_http.side_effect = fake_http
+    device_id = "device-3"
 
     session = DeviceAgentSession()
     first = session.run_turn("update device")

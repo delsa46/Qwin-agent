@@ -9,11 +9,13 @@ from agent import (
     call_model,
     build_fe_response,
     build_missing_info_actions,
+    generate_ai_message,
     map_tool_result_to_fe,
     SYSTEM_PROMPT,
 )
 from parser import parse_agent_output
-from device_tools import execute_tool
+from device_tools import _call_backend_api, _extract_device, execute_tool
+from tool_search import select_tool
 
 
 UPDATE_FIELDS = [
@@ -59,6 +61,26 @@ class DeviceAgentSession:
         self.pending_tool = None
         self.missing_fields = []
         self.collected_data = {}
+
+    def _message(
+        self,
+        *,
+        fallback_message: str,
+        user_text: str = "",
+        tool_name: Optional[str] = None,
+        tool_result: Optional[dict[str, Any]] = None,
+        missing_fields: Optional[list[str]] = None,
+        intent: str = "final",
+    ) -> str:
+        return generate_ai_message(
+            fallback_message=fallback_message,
+            user_text=user_text,
+            tool_name=tool_name,
+            tool_result=tool_result,
+            missing_fields=missing_fields,
+            current_data=self.collected_data,
+            intent=intent,
+        )
 
     @staticmethod
     def _log_event(event: str, **payload: Any) -> None:
@@ -134,6 +156,12 @@ class DeviceAgentSession:
                     break
                 if target == "GetAllDevices":
                     tool_name = "list_devices"
+                    break
+                confirm_key = str(action.get("confirmKey", "")).strip()
+                if confirm_key == "delete_device":
+                    tool_name = "delete_device"
+                    break
+                if confirm_key == "create_device_connector":
                     break
         if not tool_name:
             tool_name = self.infer_pending_tool(last_user_text)
@@ -273,12 +301,18 @@ class DeviceAgentSession:
     def _build_update_payload_question(self) -> dict[str, Any]:
         self.pending_tool = "update_device"
         self.missing_fields = UPDATE_FIELDS.copy()
+        fallback_message = (
+            "Please provide at least one update field. "
+            "You can use key=value or free text. "
+            "Examples: status=inactive, device_name=sensor-2, or device_type is gateway."
+        )
         return build_fe_response(
             context={"entity": "device", "data": self.collected_data},
-            message=(
-                "Please provide at least one update field. "
-                "You can use key=value or free text. "
-                "Examples: status=inactive, device_name=sensor-2, or device_type is gateway."
+            message=self._message(
+                fallback_message=fallback_message,
+                tool_name="update_device",
+                missing_fields=self.missing_fields,
+                intent="missing_info",
             ),
             actions=build_missing_info_actions(
                 tool_name=self.pending_tool,
@@ -288,6 +322,200 @@ class DeviceAgentSession:
             need_more_info=True,
             missing_fields=self.missing_fields,
         )
+
+    def _build_delete_confirmation(self, device: dict[str, Any], user_text: str = "") -> dict[str, Any]:
+        device_id = str(device.get("deviceId") or device.get("id") or "").strip()
+        device_name = str(device.get("name", "")).strip()
+        device_type = str(device.get("type", "")).strip()
+
+        self.pending_tool = "delete_device"
+        self.missing_fields = []
+        self.collected_data = {
+            "device_id": device_id,
+            "device_name": device_name,
+            "device_type": device_type,
+        }
+        backend_device_id = str(device.get("id", "")).strip()
+        if backend_device_id:
+            self.collected_data["backend_device_id"] = backend_device_id
+
+        details: list[str] = []
+        if device_name:
+            details.append(f"name={device_name}")
+        if device_id:
+            details.append(f"device_id={device_id}")
+        if device_type:
+            details.append(f"type={device_type}")
+        detail_text = ", ".join(details) if details else "the selected device"
+        fallback_message = f"Are you sure you want to delete this device? {detail_text}"
+
+        return build_fe_response(
+            context={"entity": "device", "data": device},
+            message=self._message(
+                fallback_message=fallback_message,
+                user_text=user_text,
+                tool_name="delete_device",
+                tool_result={"ok": True, "device": device},
+                intent="confirmation",
+            ),
+            actions=[
+                {
+                    "kind": "confirm",
+                    "label": "Delete device",
+                    "target": "DeleteDevice",
+                    "confirmKey": "delete_device",
+                    "title": "Delete device",
+                    "message": fallback_message,
+                    "variant": "danger",
+                }
+            ],
+            data={"device": device},
+            need_more_info=True,
+            missing_fields=[],
+        )
+
+    def _ask_for_valid_delete_device_id(self, error_text: str = "") -> dict[str, Any]:
+        self.pending_tool = "delete_device"
+        self.missing_fields = ["device_id"]
+        self.collected_data = {}
+        fallback_message = self._retry_device_id_message("delete_device", error_text)
+        return build_fe_response(
+            context={"entity": "device", "data": {}},
+            message=self._message(
+                fallback_message=fallback_message,
+                tool_name="delete_device",
+                missing_fields=["device_id"],
+                intent="missing_info",
+            ),
+            actions=[],
+            need_more_info=True,
+            missing_fields=["device_id"],
+        )
+
+    def _is_delete_confirmation_input(self, text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        if not normalized:
+            return False
+        if normalized in {"__confirm__:delete_device", "__action__:deletedevice"}:
+            return True
+        if normalized in {"yes", "y", "confirm", "delete", "delete device", "do it"}:
+            return True
+        return False
+
+    def _is_cancel_input(self, text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        return normalized in {"no", "n", "cancel", "stop", "لغو", "نه"}
+
+    def _lookup_device_for_delete_confirmation(self, device_id: str) -> dict[str, Any]:
+        needle = str(device_id or "").strip()
+        if not needle:
+            return {"ok": False, "error": "Missing required field for delete_device: device_id"}
+
+        list_lookup_attempt_failed = False
+        try:
+            listed = execute_tool({"name": "list_devices"})
+        except Exception:
+            listed = {"ok": False}
+            list_lookup_attempt_failed = True
+        if listed.get("ok"):
+            for item in listed.get("devices", []):
+                if not isinstance(item, dict):
+                    continue
+                candidate_device_id = str(item.get("deviceId", "")).strip()
+                candidate_internal_id = str(item.get("id", "")).strip()
+                if (
+                    candidate_device_id == needle
+                    or candidate_internal_id == needle
+                    or candidate_device_id.lower() == needle.lower()
+                    or candidate_internal_id.lower() == needle.lower()
+                ):
+                    return {"ok": True, "device": item}
+            return {"ok": False, "error": f"Device '{needle}' not found."}
+
+        if list_lookup_attempt_failed:
+            direct = _call_backend_api("GET", f"/device/{needle}")
+            if not direct.get("ok"):
+                return direct
+            device = _extract_device(direct.get("data"))
+            if device:
+                return {"ok": True, "device": device}
+        return {"ok": False, "error": f"Device '{needle}' not found."}
+
+    def _try_handle_delete_followup(self, user_text: str) -> Optional[dict[str, Any]]:
+        if self.pending_tool != "delete_device":
+            return None
+
+        if self._is_cancel_input(user_text):
+            self.reset_pending()
+            return build_fe_response(
+                context={"entity": "device", "data": {}},
+                message=self._message(
+                    fallback_message="Device deletion was canceled.",
+                    user_text=user_text,
+                    tool_name="delete_device",
+                    intent="final",
+                ),
+                actions=[],
+                need_more_info=False,
+                missing_fields=[],
+            )
+
+        if self._is_delete_confirmation_input(user_text):
+            device_id = str(self.collected_data.get("device_id", "")).strip()
+            backend_device_id = str(self.collected_data.get("backend_device_id", "")).strip()
+            if not device_id:
+                return self._ask_for_valid_delete_device_id()
+            delete_target = backend_device_id or device_id
+            direct_delete = _call_backend_api("DELETE", f"/device/{delete_target}")
+            if direct_delete.get("ok"):
+                deleted_device = _extract_device(direct_delete.get("data"))
+                if not deleted_device:
+                    deleted_device = {"deviceId": device_id}
+                    if backend_device_id:
+                        deleted_device["id"] = backend_device_id
+                tool_result = {
+                    "ok": True,
+                    "deleted": True,
+                    "device": deleted_device,
+                    "raw": direct_delete.get("data"),
+                }
+            else:
+                tool_result = execute_tool({"name": "delete_device", "device_id": device_id})
+            self._log_event(
+                "tool_executed",
+                tool="delete_device",
+                tool_data={"name": "delete_device", "device_id": device_id},
+                tool_result=tool_result,
+                path="delete_confirmation",
+            )
+            if self._should_retry_device_id("delete_device", tool_result):
+                return self._ask_for_valid_delete_device_id(str(tool_result.get("error", "")))
+            self.reset_pending()
+            return map_tool_result_to_fe("delete_device", tool_result, user_text=user_text)
+
+        extracted = self._extract_fields_from_free_text(user_text, ["device_id"])
+        candidate_device_id = str(
+            extracted.get("device_id") or self.collected_data.get("device_id", "")
+        ).strip()
+
+        if not candidate_device_id and "=" in user_text:
+            candidate_device_id = self._parse_key_value_fields(
+                user_text,
+                ["device_id"],
+            ).get("device_id", "").strip()
+
+        token = (user_text or "").strip()
+        if not candidate_device_id and token and " " not in token and "=" not in token and "," not in token:
+            candidate_device_id = self._normalize_field_value("device_id", token)
+
+        if not candidate_device_id:
+            return self._ask_for_valid_delete_device_id()
+
+        device_lookup = self._lookup_device_for_delete_confirmation(candidate_device_id)
+        if not device_lookup.get("ok"):
+            return self._ask_for_valid_delete_device_id(str(device_lookup.get("error", "")))
+
+        return self._build_delete_confirmation(device_lookup["device"], user_text)
 
     def _parse_key_value_fields(
         self,
@@ -351,7 +579,13 @@ class DeviceAgentSession:
             self.missing_fields = ["device_id"]
             return build_fe_response(
                 context={"entity": "device", "data": self.collected_data},
-                message="Please provide device_id.",
+                message=self._message(
+                    fallback_message="Please provide device_id.",
+                    user_text=user_text,
+                    tool_name="update_device",
+                    missing_fields=["device_id"],
+                    intent="missing_info",
+                ),
                 actions=[],
                 need_more_info=True,
                 missing_fields=["device_id"],
@@ -433,7 +667,11 @@ class DeviceAgentSession:
         if not self.pending_tool and not is_device_related(user_text):
             return build_fe_response(
                 context={"entity": "device", "data": {}},
-                message="I can only help with device CRUD operations.",
+                message=self._message(
+                    fallback_message="I can only help with device CRUD operations.",
+                    user_text=user_text,
+                    intent="error",
+                ),
                 actions=[],
                 need_more_info=False,
                 missing_fields=[],
@@ -443,15 +681,20 @@ class DeviceAgentSession:
             direct_tool = self._try_direct_create_from_text(user_text)
             if direct_tool is not None:
                 tool_result = execute_tool(direct_tool)
-                return map_tool_result_to_fe("create_device", tool_result)
+                return map_tool_result_to_fe("create_device", tool_result, user_text=user_text)
             inferred_tool = self.infer_pending_tool(user_text)
             if not inferred_tool and is_device_related(user_text):
                 self._log_event("ambiguous_intent", user_text=user_text)
+                fallback_message = (
+                    "I can help with device operations: create, get, update, delete, list. "
+                    "Please specify one operation."
+                )
                 return build_fe_response(
                     context={"entity": "device", "data": {}},
-                    message=(
-                        "I can help with device operations: create, get, update, delete, list. "
-                        "Please specify one operation."
+                    message=self._message(
+                        fallback_message=fallback_message,
+                        user_text=user_text,
+                        intent="missing_info",
                     ),
                     actions=[],
                     need_more_info=True,
@@ -461,6 +704,7 @@ class DeviceAgentSession:
                 return map_tool_result_to_fe(
                     "list_devices",
                     execute_tool({"name": "list_devices"}),
+                    user_text=user_text,
                 )
             if inferred_tool == "get_device":
                 device_id = self._extract_fields_from_free_text(
@@ -470,13 +714,20 @@ class DeviceAgentSession:
                     return map_tool_result_to_fe(
                         "get_device",
                         execute_tool({"name": "get_device", "device_id": device_id}),
+                        user_text=user_text,
                     )
                 self.pending_tool = "get_device"
                 self.missing_fields = ["device_id"]
                 self.collected_data = {}
                 return build_fe_response(
                     context={"entity": "device", "data": {}},
-                    message="Please provide device_id.",
+                    message=self._message(
+                        fallback_message="Please provide device_id.",
+                        user_text=user_text,
+                        tool_name="get_device",
+                        missing_fields=["device_id"],
+                        intent="missing_info",
+                    ),
                     actions=[],
                     need_more_info=True,
                     missing_fields=["device_id"],
@@ -486,16 +737,24 @@ class DeviceAgentSession:
                     user_text, ["device_id"]
                 ).get("device_id", "")
                 if device_id:
-                    return map_tool_result_to_fe(
-                        "delete_device",
-                        execute_tool({"name": "delete_device", "device_id": device_id}),
-                    )
+                    device_lookup = self._lookup_device_for_delete_confirmation(device_id)
+                    if not device_lookup.get("ok"):
+                        return self._ask_for_valid_delete_device_id(
+                            str(device_lookup.get("error", ""))
+                        )
+                    return self._build_delete_confirmation(device_lookup["device"], user_text)
                 self.pending_tool = "delete_device"
                 self.missing_fields = ["device_id"]
                 self.collected_data = {}
                 return build_fe_response(
                     context={"entity": "device", "data": {}},
-                    message="Please provide device_id.",
+                    message=self._message(
+                        fallback_message="Please provide device_id.",
+                        user_text=user_text,
+                        tool_name="delete_device",
+                        missing_fields=["device_id"],
+                        intent="missing_info",
+                    ),
                     actions=[],
                     need_more_info=True,
                     missing_fields=["device_id"],
@@ -512,6 +771,7 @@ class DeviceAgentSession:
                     return map_tool_result_to_fe(
                         "update_device",
                         execute_tool(tool_payload),
+                        user_text=user_text,
                     )
                 if not device_id:
                     self.pending_tool = "update_device"
@@ -519,7 +779,13 @@ class DeviceAgentSession:
                     self.collected_data = update_data
                     return build_fe_response(
                         context={"entity": "device", "data": self.collected_data},
-                        message="Please provide device_id.",
+                        message=self._message(
+                            fallback_message="Please provide device_id.",
+                            user_text=user_text,
+                            tool_name="update_device",
+                            missing_fields=["device_id"],
+                            intent="missing_info",
+                        ),
                         actions=[],
                         need_more_info=True,
                         missing_fields=["device_id"],
@@ -541,9 +807,15 @@ class DeviceAgentSession:
                     self.missing_fields = still_missing
                     return build_fe_response(
                         context={"entity": "device", "data": self.collected_data},
-                        message=(
-                            "To create a new device, please provide these fields: "
-                            "name, deviceId, type."
+                        message=self._message(
+                            fallback_message=(
+                                "To create a new device, please provide these fields: "
+                                "name, deviceId, type."
+                            ),
+                            user_text=user_text,
+                            tool_name="create_device",
+                            missing_fields=self.missing_fields,
+                            intent="missing_info",
                         ),
                         actions=build_missing_info_actions(
                             tool_name="create_device",
@@ -555,6 +827,10 @@ class DeviceAgentSession:
                     )
 
         if self.pending_tool:
+            delete_followup_response = self._try_handle_delete_followup(user_text)
+            if delete_followup_response is not None:
+                return delete_followup_response
+
             fast_update_response = self._try_handle_update_followup(user_text)
             if fast_update_response is not None:
                 return fast_update_response
@@ -565,7 +841,12 @@ class DeviceAgentSession:
                 if self.pending_tool == "create_device" and not self._is_create_confirmation_input(user_text):
                     return build_fe_response(
                         context={"entity": "device", "data": self.collected_data},
-                        message="I have all required fields. Do you want me to create the device now?",
+                        message=self._message(
+                            fallback_message="I have all required fields. Do you want me to create the device now?",
+                            user_text=user_text,
+                            tool_name="create_device",
+                            intent="confirmation",
+                        ),
                         actions=[
                             {
                                 "type": "button",
@@ -579,7 +860,14 @@ class DeviceAgentSession:
                     )
                 parsed = parse_agent_output(synthesized)
                 tool_data = parsed["data"]
-                tool_name = tool_data.get("name", "")
+                selection = select_tool(
+                    user_text=user_text,
+                    candidate_tool=tool_data.get("name", ""),
+                    tool_data=tool_data,
+                    pending_tool=self.pending_tool,
+                )
+                tool_name = selection.tool_name or str(tool_data.get("name", "")).strip()
+                tool_data["name"] = tool_name
                 if tool_name == "update_device" and not self._has_update_payload(tool_data):
                     if not self._ensure_valid_update_device_id(tool_data.get("device_id", "")):
                         return self._ask_for_valid_update_device_id()
@@ -599,8 +887,15 @@ class DeviceAgentSession:
                     }
                     return build_fe_response(
                         context={"entity": "device", "data": self.collected_data},
-                        message=self._friendly_create_error_message(
-                            str(tool_result.get("error", ""))
+                        message=self._message(
+                            fallback_message=self._friendly_create_error_message(
+                                str(tool_result.get("error", ""))
+                            ),
+                            user_text=user_text,
+                            tool_name="create_device",
+                            tool_result=tool_result,
+                            missing_fields=missing_fields,
+                            intent="missing_info",
                         ),
                         actions=build_missing_info_actions(
                             tool_name="create_device",
@@ -616,16 +911,23 @@ class DeviceAgentSession:
                     self.collected_data = {}
                     return build_fe_response(
                         context={"entity": "device", "data": {}},
-                        message=self._retry_device_id_message(
-                            tool_name,
-                            str(tool_result.get("error", "")),
+                        message=self._message(
+                            fallback_message=self._retry_device_id_message(
+                                tool_name,
+                                str(tool_result.get("error", "")),
+                            ),
+                            user_text=user_text,
+                            tool_name=tool_name,
+                            tool_result=tool_result,
+                            missing_fields=["device_id"],
+                            intent="missing_info",
                         ),
                         actions=[],
                         need_more_info=True,
                         missing_fields=["device_id"],
                     )
                 self.reset_pending()
-                return map_tool_result_to_fe(tool_name, tool_result)
+                return map_tool_result_to_fe(tool_name, tool_result, user_text=user_text)
 
             still_missing = [
                 field for field in self.missing_fields
@@ -634,7 +936,13 @@ class DeviceAgentSession:
             if still_missing:
                 return build_fe_response(
                     context={"entity": "device", "data": self.collected_data},
-                    message=f"Please provide: {', '.join(still_missing)}",
+                    message=self._message(
+                        fallback_message=f"Please provide: {', '.join(still_missing)}",
+                        user_text=user_text,
+                        tool_name=self.pending_tool,
+                        missing_fields=still_missing,
+                        intent="missing_info",
+                    ),
                     actions=build_missing_info_actions(
                         tool_name=self.pending_tool,
                         missing_fields=still_missing,
@@ -654,7 +962,11 @@ class DeviceAgentSession:
             self._log_event("model_error", user_text=user_text, error=str(exc))
             return build_fe_response(
                 context={"entity": "device", "data": {}},
-                message=f"{exc}. Please try again.",
+                message=self._message(
+                    fallback_message=f"{exc}. Please try again.",
+                    user_text=user_text,
+                    intent="error",
+                ),
                 actions=[],
                 need_more_info=False,
                 missing_fields=[],
@@ -669,9 +981,16 @@ class DeviceAgentSession:
                 self.pending_tool,
                 parsed.get("missing_fields", []),
             )
+            fallback_message = parsed["data"].get("question", "Please provide more information.")
             return build_fe_response(
                 context={"entity": "device", "data": {}},
-                message=parsed["data"].get("question", "Please provide more information."),
+                message=self._message(
+                    fallback_message=fallback_message,
+                    user_text=user_text,
+                    tool_name=self.pending_tool,
+                    missing_fields=self.missing_fields,
+                    intent="missing_info",
+                ),
                 actions=build_missing_info_actions(
                     tool_name=self.pending_tool,
                     missing_fields=self.missing_fields,
@@ -683,7 +1002,14 @@ class DeviceAgentSession:
 
         if parsed["kind"] == "tool":
             tool_data = parsed["data"]
-            tool_name = tool_data.get("name", "")
+            selection = select_tool(
+                user_text=user_text,
+                candidate_tool=tool_data.get("name", ""),
+                tool_data=tool_data,
+                pending_tool=self.pending_tool,
+            )
+            tool_name = selection.tool_name or str(tool_data.get("name", "")).strip()
+            tool_data["name"] = tool_name
             if tool_name == "update_device" and not self._has_update_payload(tool_data):
                 if not self._ensure_valid_update_device_id(tool_data.get("device_id", "")):
                     return self._ask_for_valid_update_device_id()
@@ -706,8 +1032,15 @@ class DeviceAgentSession:
                 }
                 return build_fe_response(
                     context={"entity": "device", "data": self.collected_data},
-                    message=self._friendly_create_error_message(
-                        str(tool_result.get("error", ""))
+                    message=self._message(
+                        fallback_message=self._friendly_create_error_message(
+                            str(tool_result.get("error", ""))
+                        ),
+                        user_text=user_text,
+                        tool_name="create_device",
+                        tool_result=tool_result,
+                        missing_fields=missing_fields,
+                        intent="missing_info",
                     ),
                     actions=build_missing_info_actions(
                         tool_name="create_device",
@@ -723,40 +1056,39 @@ class DeviceAgentSession:
                 self.collected_data = {}
                 return build_fe_response(
                     context={"entity": "device", "data": {}},
-                    message=self._retry_device_id_message(
-                        tool_name,
-                        str(tool_result.get("error", "")),
+                    message=self._message(
+                        fallback_message=self._retry_device_id_message(
+                            tool_name,
+                            str(tool_result.get("error", "")),
+                        ),
+                        user_text=user_text,
+                        tool_name=tool_name,
+                        tool_result=tool_result,
+                        missing_fields=["device_id"],
+                        intent="missing_info",
                     ),
                     actions=[],
                     need_more_info=True,
                     missing_fields=["device_id"],
                 )
             self.reset_pending()
-            return map_tool_result_to_fe(tool_name, tool_result)
+            return map_tool_result_to_fe(tool_name, tool_result, user_text=user_text)
 
         return build_fe_response(
             context={"entity": "device", "data": {}},
-            message=parsed["data"]["message"],
+            message=self._message(
+                fallback_message=parsed["data"]["message"],
+                user_text=user_text,
+                intent="final",
+            ),
             actions=[],
             need_more_info=False,
             missing_fields=[],
         )
 
     def infer_pending_tool(self, user_text: str) -> Optional[str]:
-        text = user_text.lower()
-
-        if self._matches_intent_keywords(text, ["create", "add", "new"]):
-            return "create_device"
-        if self._matches_intent_keywords(text, ["update", "edit", "change", "modify"]):
-            return "update_device"
-        if self._matches_intent_keywords(text, ["delete", "remove"]):
-            return "delete_device"
-        if self._matches_intent_keywords(text, ["get", "show", "find", "detail"]):
-            return "get_device"
-        if self._matches_intent_keywords(text, ["list", "all devices"]):
-            return "list_devices"
-
-        return None
+        selection = select_tool(user_text=user_text)
+        return selection.tool_name
 
     def _extract_value(self, text: str, patterns: list[str]) -> Optional[str]:
         for pattern in patterns:
@@ -767,6 +1099,14 @@ class DeviceAgentSession:
                     return value
         return None
 
+    def _name_field_boundary(self) -> str:
+        return (
+            r"(?=,|"
+            r"\s+(?:and\s+)?(?:device\s+id|id\s+is|device\s+type|type\s+is|typy\s+is|"
+            r"status\s+is|group\s+is|role\s+is|description\s+is|save[_\s]?data\s+is|"
+            r"tags\s+are|features\s+are)\b|$)"
+        )
+
     def _try_direct_create_from_text(self, user_text: str) -> Optional[dict[str, str]]:
         lowered = user_text.lower()
         if "create" not in lowered or "device" not in lowered:
@@ -775,9 +1115,9 @@ class DeviceAgentSession:
         name = self._extract_value(
             user_text,
             [
-                r"\bname\s+is\s+([a-zA-Z0-9._\-]+)",
-                r"\bnamed\s+([a-zA-Z0-9._\-]+)",
-                r"\bdevice\s+([a-zA-Z0-9._\-]+)",
+                rf"\bname\s+is\s+(.+?){self._name_field_boundary()}",
+                rf"\bnamed\s+(.+?){self._name_field_boundary()}",
+                rf"\bdevice\s+(.+?){self._name_field_boundary()}",
             ],
         )
         device_type = self._extract_value(
@@ -881,7 +1221,12 @@ class DeviceAgentSession:
         self.collected_data = {}
         return build_fe_response(
             context={"entity": "device", "data": {}},
-            message="Device not found or device_id is invalid. Please provide a valid device_id.",
+            message=self._message(
+                fallback_message="Device not found or device_id is invalid. Please provide a valid device_id.",
+                tool_name="update_device",
+                missing_fields=["device_id"],
+                intent="missing_info",
+            ),
             actions=[],
             need_more_info=True,
             missing_fields=["device_id"],
@@ -1002,6 +1347,8 @@ class DeviceAgentSession:
             device_id = self._extract_value(
                 text,
                 [
+                    r"\bdevice[_\s]?id\s*[:=]\s*([a-zA-Z0-9._\-]+)\b",
+                    r"\bid\s*[:=]\s*([a-zA-Z0-9._\-]+)\b",
                     r"\bdevice\s+id\s+is\s+([a-zA-Z0-9._\-]+)\b",
                     r"\bdevice\s+id\s+([a-zA-Z0-9._\-]+)\b",
                     r"\bid\s+is\s+([a-zA-Z0-9._\-]+)\b",
@@ -1039,13 +1386,13 @@ class DeviceAgentSession:
             device_name = self._extract_value(
                 text,
                 [
-                    r"\bdevice\s+name\s+is\s+([a-zA-Z0-9._\-]+)\b",
-                    r"\bname\s+is\s+([a-zA-Z0-9._\-]+)\b",
-                    r"\bnam\s+is\s+([a-zA-Z0-9._\-]+)\b",
-                    r"\bmame\s+is\s+([a-zA-Z0-9._\-]+)\b",
-                    r"\bnamed\s+([a-zA-Z0-9._\-]+)\b",
-                    r"\b([a-zA-Z0-9._\-]+)\s+is\s+name\b",
-                    r"\bname\s+([a-zA-Z0-9._\-]+)\b(?!\s+is\b)",
+                    rf"\bdevice\s+name\s+is\s+(.+?){self._name_field_boundary()}",
+                    rf"\bname\s+is\s+(.+?){self._name_field_boundary()}",
+                    rf"\bnam\s+is\s+(.+?){self._name_field_boundary()}",
+                    rf"\bmame\s+is\s+(.+?){self._name_field_boundary()}",
+                    rf"\bnamed\s+(.+?){self._name_field_boundary()}",
+                    r"\b(.+?)\s+is\s+name\b",
+                    rf"\bname\s+(.+?){self._name_field_boundary()}",
                 ],
             )
             if device_name:

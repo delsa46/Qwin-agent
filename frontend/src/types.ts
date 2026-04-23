@@ -20,6 +20,7 @@ export type LegacyFormAction = {
 export type UiAction =
   | {
       kind: "navigate";
+      operationId?: string;
       destination:
         | { screen: "resource_list"; resource: string }
         | { screen: "resource_detail"; resource: string; idFrom: string }

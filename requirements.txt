@@ -1,0 +1,4 @@
+# Runtime code currently relies on Python's standard library.
+# The package below is needed for local development and test execution.
+
+pytest>=8,<9

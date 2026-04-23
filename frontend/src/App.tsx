@@ -46,6 +46,39 @@ function extractDevices(response: AgentResponse): Array<{ id?: string; deviceId?
   return [];
 }
 
+function resolvePathValue(source: unknown, path: string): unknown {
+  if (!path) return undefined;
+  return path.split(".").reduce<unknown>((acc, segment) => {
+    if (!acc || typeof acc !== "object") return undefined;
+    return (acc as Record<string, unknown>)[segment];
+  }, source);
+}
+
+function extractSingleDevice(response: AgentResponse): { id?: string; deviceId?: string; name?: string; type?: string } | null {
+  const data = response.data as Record<string, unknown> | undefined;
+  if (data && data.device && typeof data.device === "object") {
+    return data.device as { id?: string; deviceId?: string; name?: string; type?: string };
+  }
+  const contextData = response.context?.data;
+  if (contextData && typeof contextData === "object" && !Array.isArray(contextData)) {
+    return contextData as { id?: string; deviceId?: string; name?: string; type?: string };
+  }
+  return null;
+}
+
+function resolveDeviceIdentifier(response: AgentResponse | null, path?: string): string {
+  if (!response) return "";
+
+  const resolvedValue = path ? resolvePathValue(response, path) : undefined;
+  const resolvedText = typeof resolvedValue === "string" ? resolvedValue.trim() : "";
+  if (resolvedText) {
+    return resolvedText;
+  }
+
+  const device = extractSingleDevice(response);
+  return String(device?.deviceId || "").trim();
+}
+
 export default function App() {
   const [history, setHistory] = useState<ChatHistoryItem[]>([]);
   const [input, setInput] = useState("");
@@ -76,7 +109,11 @@ export default function App() {
           history
         })
       });
-      const data = (await res.json()) as { ok: boolean; error?: string; history?: ChatHistoryItem[] };
+      const data = (await res.json()) as {
+        ok: boolean;
+        error?: string;
+        history?: ChatHistoryItem[];
+      };
       if (!res.ok || !data.ok || !data.history) {
         throw new Error(data.error || "API request failed");
       }
@@ -125,6 +162,30 @@ export default function App() {
         type="button"
         title={title}
         onClick={() => {
+          if (action.kind === "navigate") {
+            const response = latestAssistant;
+            const deviceIdentifier =
+              response && "idFrom" in action.destination
+                ? resolveDeviceIdentifier(response, action.destination.idFrom)
+                : resolveDeviceIdentifier(response);
+
+            if (action.operationId === "UpdateDevice" || action.destination.screen === "resource_edit") {
+              void sendMessage(`update device id is ${deviceIdentifier}`);
+              return;
+            }
+            if (action.operationId === "GetDeviceById" || action.destination.screen === "resource_detail") {
+              void sendMessage(`get device id is ${deviceIdentifier}`);
+              return;
+            }
+            if (action.destination.screen === "resource_create") {
+              void sendMessage(`create ${action.destination.resource}`);
+              return;
+            }
+            if (action.destination.screen === "resource_list") {
+              void sendMessage(`${action.destination.resource} list`);
+              return;
+            }
+          }
           if (action.kind === "show_list") {
             void sendMessage(`${action.resource} list`);
             return;

@@ -10,6 +10,44 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 ALLOWED_DEVICE_TYPES = {"sensor", "gateway", "controller", "processor", "ipcamera"}
+TOOL_CATALOG: dict[str, dict[str, Any]] = {
+    "create_device": {
+        "description": "Create a new device record.",
+        "required_fields": ["device_name", "device_id", "device_type"],
+        "keywords": ["create", "add", "new"],
+    },
+    "get_device": {
+        "description": "Get one device by id.",
+        "required_fields": ["device_id"],
+        "keywords": ["get", "show", "find", "detail"],
+    },
+    "update_device": {
+        "description": "Update an existing device.",
+        "required_fields": ["device_id"],
+        "optional_fields": [
+            "device_name",
+            "device_type",
+            "role",
+            "description",
+            "group",
+            "save_data",
+            "status",
+            "tags",
+            "features",
+        ],
+        "keywords": ["update", "edit", "change", "modify"],
+    },
+    "delete_device": {
+        "description": "Delete one device by id.",
+        "required_fields": ["device_id"],
+        "keywords": ["delete", "remove"],
+    },
+    "list_devices": {
+        "description": "List all devices.",
+        "required_fields": [],
+        "keywords": ["list", "all devices"],
+    },
+}
 
 
 def _load_dotenv(dotenv_path: str | Path | None = None) -> None:
@@ -410,7 +448,10 @@ def get_device(device_id: str) -> dict:
         return {"ok": False, "error": "Missing required field for get_device: device_id"}
 
     raw = str(device_id).strip()
-    response = _call_backend_api("GET", f"/device/{raw}")
+    resolved = _resolve_backend_device_identifier(raw)
+    response = _call_backend_api("GET", f"/device/{resolved}")
+    if not response["ok"] and resolved != raw:
+        response = _call_backend_api("GET", f"/device/{raw}")
     if not response["ok"]:
         if _is_device_id_lookup_error(response.get("error", "")):
             from_list = _find_device_in_list(raw)

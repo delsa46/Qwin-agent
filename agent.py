@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from parser import parse_agent_output
 from device_tools import execute_tool
+from tool_search import select_tool
 
 ALLOWED_DEVICE_TYPES = ["sensor", "gateway", "controller", "processor", "ipcamera"]
 
@@ -44,6 +45,7 @@ MODEL_SERVER = os.getenv(
 )
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen")
 API_KEY = os.getenv("MODEL_API_KEY", "tensorrt_llm")
+MODEL_REASONING_EFFORT = os.getenv("MODEL_REASONING_EFFORT", "default")
 
 
 def _normalize_model_server_url(url: str) -> str:
@@ -106,11 +108,24 @@ Rules:
 - For list_devices no field is needed
 """
 
+RESPONSE_WRITER_PROMPT = """You write concise end-user messages for a device CRUD assistant.
+
+Rules:
+- Return plain text only
+- Do not use XML, JSON, or markdown
+- Match the user's language when it is clear from the conversation
+- Keep the message short, clear, and natural
+- If information is missing, ask only for the missing fields
+- If an operation succeeded, summarize the result naturally
+- If an operation failed, explain the problem simply and helpfully
+"""
+
 
 def call_model(messages: List[Dict[str, str]]) -> str:
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
+        "reasoning_effort": MODEL_REASONING_EFFORT,
         "temperature": 0,
         "max_tokens": 256,
     }
@@ -142,6 +157,49 @@ def call_model(messages: List[Dict[str, str]]) -> str:
 
     data = json.loads(response_body)
     return data["choices"][0]["message"]["content"]
+
+
+def generate_ai_message(
+    *,
+    fallback_message: str,
+    user_text: str = "",
+    tool_name: Optional[str] = None,
+    tool_result: Optional[dict[str, Any]] = None,
+    missing_fields: Optional[List[str]] = None,
+    current_data: Optional[dict[str, Any]] = None,
+    intent: str = "final",
+) -> str:
+    prompt_payload = {
+        "intent": intent,
+        "user_text": user_text,
+        "tool_name": tool_name,
+        "tool_result": tool_result,
+        "missing_fields": missing_fields or [],
+        "current_data": current_data or {},
+        "fallback_message": fallback_message,
+    }
+
+    try:
+        message = call_model(
+            [
+                {"role": "system", "content": RESPONSE_WRITER_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Write the assistant message for this situation.\n"
+                        f"{json.dumps(prompt_payload, ensure_ascii=False)}"
+                    ),
+                },
+            ]
+        ).strip()
+    except RuntimeError:
+        return fallback_message
+
+    parsed = parse_agent_output(message)
+    if parsed.get("kind") != "final":
+        return fallback_message
+
+    return message or fallback_message
 
 
 def build_fe_response(
@@ -217,15 +275,28 @@ def build_missing_info_actions(
     return []
 
 
-def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
+def map_tool_result_to_fe(
+    tool_name: str,
+    tool_result: dict,
+    *,
+    user_text: str = "",
+) -> dict:
     if not tool_result.get("ok"):
         error_message = tool_result.get("error", "Tool execution failed.")
         if tool_name == "create_device" and "invalid device type" in str(error_message).lower():
+            fallback_message = (
+                "Invalid device type. Allowed values are: "
+                + ", ".join(ALLOWED_DEVICE_TYPES)
+            )
             return build_fe_response(
                 context={"entity": "device", "data": {}},
-                message=(
-                    "Invalid device type. Allowed values are: "
-                    + ", ".join(ALLOWED_DEVICE_TYPES)
+                message=generate_ai_message(
+                    fallback_message=fallback_message,
+                    user_text=user_text,
+                    tool_name=tool_name,
+                    tool_result=tool_result,
+                    missing_fields=["device_type"],
+                    intent="missing_info",
                 ),
                 actions=build_missing_info_actions(
                     tool_name="create_device",
@@ -241,7 +312,13 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
                 "data": tool_result,
             },
             data={"result": tool_result},
-            message=error_message,
+            message=generate_ai_message(
+                fallback_message=error_message,
+                user_text=user_text,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                intent="error",
+            ),
             actions=[],
             need_more_info=False,
             missing_fields=[],
@@ -249,19 +326,27 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "create_device":
         device = tool_result["device"]
+        fallback_message = "Device created successfully."
         return build_fe_response(
             context={
                 "entity": "device",
                 "data": device,
             },
-            message="Device created successfully.",
+            message=generate_ai_message(
+                fallback_message=fallback_message,
+                user_text=user_text,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                intent="success",
+            ),
             actions=[
                 {
                     "kind": "navigate",
+                    "operationId": "GetDeviceById",
                     "destination": {
                         "screen": "resource_detail",
                         "resource": "device",
-                        "idFrom": "data.device.id",
+                        "idFrom": "data.device.deviceId",
                     },
                     "label": "Open device detail",
                     "variant": "success",
@@ -287,19 +372,27 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "get_device":
         device = tool_result["device"]
+        fallback_message = "Device fetched successfully."
         return build_fe_response(
             context={
                 "entity": "device",
                 "data": device,
             },
-            message="Device fetched successfully.",
+            message=generate_ai_message(
+                fallback_message=fallback_message,
+                user_text=user_text,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                intent="success",
+            ),
             actions=[
                 {
                     "kind": "navigate",
+                    "operationId": "UpdateDevice",
                     "destination": {
                         "screen": "resource_edit",
                         "resource": "device",
-                        "idFrom": "data.device.id",
+                        "idFrom": "data.device.deviceId",
                     },
                     "label": "Edit device",
                     "variant": "primary",
@@ -316,19 +409,27 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "update_device":
         device = tool_result["device"]
+        fallback_message = "Device updated successfully."
         return build_fe_response(
             context={
                 "entity": "device",
                 "data": device,
             },
-            message="Device updated successfully.",
+            message=generate_ai_message(
+                fallback_message=fallback_message,
+                user_text=user_text,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                intent="success",
+            ),
             actions=[
                 {
                     "kind": "navigate",
+                    "operationId": "GetDeviceById",
                     "destination": {
                         "screen": "resource_detail",
                         "resource": "device",
-                        "idFrom": "data.device.id",
+                        "idFrom": "data.device.deviceId",
                     },
                     "label": "Open updated device",
                     "variant": "success",
@@ -345,12 +446,19 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "delete_device":
         device = tool_result["device"]
+        fallback_message = "Device deleted successfully."
         return build_fe_response(
             context={
                 "entity": "device",
                 "data": device,
             },
-            message="Device deleted successfully.",
+            message=generate_ai_message(
+                fallback_message=fallback_message,
+                user_text=user_text,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                intent="success",
+            ),
             actions=[
                 {
                     "kind": "show_list",
@@ -373,12 +481,19 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
 
     if tool_name == "list_devices":
         devices = tool_result["devices"]
+        fallback_message = f"{len(devices)} device(s) found."
         return build_fe_response(
             context={
                 "entity": "device_list",
                 "data": devices,
             },
-            message=f"{len(devices)} device(s) found.",
+            message=generate_ai_message(
+                fallback_message=fallback_message,
+                user_text=user_text,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                intent="success",
+            ),
             actions=[
                 {
                     "kind": "navigate",
@@ -399,7 +514,13 @@ def map_tool_result_to_fe(tool_name: str, tool_result: dict) -> dict:
             "data": tool_result,
         },
         data={"result": tool_result},
-        message="Operation completed.",
+        message=generate_ai_message(
+            fallback_message="Operation completed.",
+            user_text=user_text,
+            tool_name=tool_name,
+            tool_result=tool_result,
+            intent="success",
+        ),
         actions=[],
     )
 
@@ -423,7 +544,14 @@ def run_agent(user_text: str, max_turns: int = 3) -> dict:
                     "entity": "device",
                     "data": {},
                 },
-                message=question,
+                message=generate_ai_message(
+                    fallback_message=question,
+                    user_text=user_text,
+                    tool_name=ask_tool,
+                    missing_fields=missing_fields,
+                    current_data={},
+                    intent="missing_info",
+                ),
                 actions=build_missing_info_actions(
                     tool_name=ask_tool,
                     missing_fields=missing_fields,
@@ -435,22 +563,16 @@ def run_agent(user_text: str, max_turns: int = 3) -> dict:
 
         if parsed["kind"] == "tool":
             tool_data = parsed["data"]
-            tool_name = tool_data.get("name", "")
+            selection = select_tool(
+                user_text=user_text,
+                candidate_tool=tool_data.get("name", ""),
+                tool_data=tool_data,
+            )
+            tool_name = selection.tool_name or str(tool_data.get("name", "")).strip()
+            tool_data["name"] = tool_name
             tool_result = execute_tool(tool_data)
 
-            messages.append({"role": "assistant", "content": assistant_text})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Tool result:\n"
-                        f"{json.dumps(tool_result, ensure_ascii=False)}\n\n"
-                        "Now provide a short final answer in plain text only."
-                    ),
-                }
-            )
-
-            fe_response = map_tool_result_to_fe(tool_name, tool_result)
+            fe_response = map_tool_result_to_fe(tool_name, tool_result, user_text=user_text)
             return fe_response
 
         if parsed["kind"] == "final":
@@ -459,7 +581,12 @@ def run_agent(user_text: str, max_turns: int = 3) -> dict:
                     "entity": "device",
                     "data": {},
                 },
-                message=parsed["data"]["message"],
+                message=generate_ai_message(
+                    fallback_message=parsed["data"]["message"],
+                    user_text=user_text,
+                    current_data={},
+                    intent="final",
+                ),
                 actions=[],
                 need_more_info=False,
                 missing_fields=[],
@@ -467,7 +594,12 @@ def run_agent(user_text: str, max_turns: int = 3) -> dict:
 
     return build_fe_response(
         context={"entity": "device", "data": {}},
-        message="Max turns reached without a valid result.",
+        message=generate_ai_message(
+            fallback_message="Max turns reached without a valid result.",
+            user_text=user_text,
+            current_data={},
+            intent="error",
+        ),
         actions=[],
         need_more_info=False,
         missing_fields=[],
